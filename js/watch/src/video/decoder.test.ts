@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import * as Catalog from "@moq/hang/catalog";
-import { Legacy } from "@moq/hang/container";
+import { Legacy, Timeline } from "@moq/hang/container";
 import { Time, Track } from "@moq/net";
 import { Signal } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
@@ -69,11 +69,12 @@ afterEach(() => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 });
-function fixture() {
+function fixture(withTimeline = false) {
 	const low = Catalog.VideoConfigSchema.parse({
 		codec: "avc1.64001f",
 		bitrate: 400_000,
 		container: { kind: "legacy" },
+		timeline: withTimeline ? { track: "low.timeline.z", timescale: 1000 } : undefined,
 	});
 	const high = Catalog.VideoConfigSchema.parse({
 		codec: "hvc1.1.6.L93.90",
@@ -83,7 +84,12 @@ function fixture() {
 	const available = new Signal({ low, high });
 	const selected = new Signal<string | undefined>("low");
 	const config = new Signal<Catalog.VideoConfig | undefined>(low);
-	const producers = { low: new Track.Producer("low").accept(), high: new Track.Producer("high").accept() };
+	const producers = {
+		low: new Track.Producer("low").accept(),
+		high: new Track.Producer("high").accept(),
+		"low.timeline.z": new Track.Producer("low.timeline.z").accept(),
+	};
+	const timeline = withTimeline ? new Timeline.Producer(producers["low.timeline.z"], { granularity: 0 }) : undefined;
 	const opened: { name: string; sub: Track.Subscriber; options: Track.Subscription }[] = [];
 	const wire = {
 		track: (name: keyof typeof producers) => ({
@@ -103,8 +109,9 @@ function fixture() {
 	const paced = new Signal(false);
 	const waits: (() => void)[] = [];
 	let resets = 0;
+	const buffer = new Signal(Time.Milli.zero);
 	const sync = {
-		out: { buffer: new Signal(Time.Milli.zero), reference: new Signal(0) },
+		out: { buffer, reference: new Signal(0) },
 		received: (pts: number) => received.push(pts),
 		reset: () => {
 			resets++;
@@ -121,6 +128,9 @@ function fixture() {
 		group.close();
 	}
 	return {
+		timeline,
+		sync,
+		buffer,
 		decoder,
 		selected,
 		config,
@@ -141,6 +151,54 @@ function fixture() {
 		},
 	};
 }
+
+test("downshift requests a bounded group from its own warm timeline and keeps retired media closed", async () => {
+	const f = fixture(true);
+	try {
+		await settle();
+		f.send("low", 1000);
+		f.timeline?.record(71, Time.Micro(1000000));
+		await settle();
+		f.selected.set("high");
+		await settle();
+		f.send("high", 1500);
+		await settle();
+		f.timeline?.record(99, Time.Micro(1250000));
+		await settle();
+		f.buffer.set(Time.Milli(700));
+		f.paced.set(true);
+		f.selected.set("low");
+		await settle();
+		const requested = f.opened.filter((value) => value.name === "low").at(-1);
+		if (!requested) throw new Error("replacement subscription missing");
+		expect(requested.options).toEqual({
+			priority: Catalog.PRIORITY.video,
+			startGroup: 99,
+			ordered: true,
+			latencyMax: 700,
+		});
+		expect(f.decoder.out.receive.peek().pending?.startGroup).toBe(99);
+		expect(f.opened.filter((value) => value.name === "low.timeline.z")).toHaveLength(1);
+		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(1500));
+		// A replacement frame older than the outgoing picture must never become visible.
+		f.send("low", 1400);
+		await settle();
+		f.release();
+		await settle();
+		expect(f.decoder.out.track.peek()).toBe("high");
+		f.send("low", 1600);
+		await settle();
+		f.release();
+		await settle();
+		expect(f.decoder.out.track.peek()).toBe("low");
+		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(1600));
+		f.decoder.close();
+		expect(f.opened.find((value) => value.name === "low.timeline.z")?.sub.closed.peek()).toBeDefined();
+	} finally {
+		f.close();
+		await settle();
+	}
+});
 
 test("a new track uses its own decoder config before the separate config signal settles", async () => {
 	const f = fixture();

@@ -69,6 +69,8 @@ export interface TrackReceive extends Container.ReceiveProgress {
 	track: string;
 	/** Monotonic identity within this Decoder; changes when the same rendition is reopened. */
 	subscriptionId: number;
+	/** Recorded replacement group requested from history; absent for latest-only delivery. */
+	startGroup?: number;
 }
 
 type DecoderOutput = {
@@ -120,6 +122,12 @@ export class Decoder {
 	#active = new Signal<DecoderTrack | undefined>(undefined);
 	#pending = new Signal<DecoderTrack | undefined>(undefined);
 	#subscriptionSequence = 0;
+	#timelines: {
+		broadcast: Moq.Broadcast.Consumer;
+		track: string;
+		section: string;
+		reader: Container.Timeline.Consumer;
+	}[] = [];
 	readonly #selection: Computed<{ track: string; identity: PlaybackIdentity } | undefined>;
 
 	#signals = new Effect();
@@ -149,6 +157,14 @@ export class Decoder {
 			return track !== undefined && config ? { track, identity: playbackIdentity(config) } : undefined;
 		});
 
+		this.#signals.run((effect) => {
+			effect.get(this.in.enabled);
+			effect.get(this.source.in.broadcast);
+			effect.cleanup(() => {
+				for (const value of this.#timelines) value.reader.close();
+				this.#timelines = [];
+			});
+		});
 		this.#signals.run(this.#runPending.bind(this));
 		this.#signals.run(this.#runActive.bind(this));
 		this.#signals.run(this.#runDisplay.bind(this));
@@ -190,9 +206,39 @@ export class Decoder {
 		)
 			return;
 		const renditions = this.source.out.available.peek();
+		const section = renditions[track]?.timeline;
+		let timeline = this.#timelines.find((value) => value.broadcast === active && value.track === track);
+		if (timeline && timeline.section !== JSON.stringify(section)) {
+			timeline.reader.close();
+			this.#timelines = this.#timelines.filter((value) => value !== timeline);
+			timeline = undefined;
+		}
+		if (section && !timeline) {
+			// Learn metadata for tracks actually selected, keeping it warm after their video retires.
+			// This avoids downloading alternate media just to prepare a future downshift.
+			if (this.#timelines.length >= 8) this.#timelines.shift()?.reader.close();
+			const reader = new Container.Timeline.Consumer(
+				active.track(section.track).subscribe({ priority: Catalog.PRIORITY.video - 2 }),
+				section,
+			);
+			timeline = { broadcast: active, track, section: JSON.stringify(section), reader };
+			this.#timelines.push(timeline);
+		}
 		const downshift =
 			current !== undefined &&
 			(renditions[track]?.bitrate ?? Infinity) < (renditions[current.track]?.bitrate ?? 0);
+		// Request a recorded group that covers the outgoing tail. Latest-only delivery can
+		// begin after that tail, leaving a real media hole even when decoding is quick.
+		let tail = current?.timestamp.peek();
+		if (tail !== undefined)
+			for (const range of current?.buffered.peek() ?? []) {
+				if (range.start > tail) break;
+				if (range.end > tail) tail = range.end;
+			}
+		const history =
+			downshift && tail !== undefined && this.in.paced.peek()
+				? timeline?.reader.lookup(tail, Math.min(2000, this.sync.out.buffer.peek() + 1000))
+				: undefined;
 		// Stop obsolete bytes immediately, but let its decoded tail keep playing.
 		if (downshift) current.stopDownload();
 
@@ -201,6 +247,7 @@ export class Decoder {
 			failure: this.#out.error,
 			clockAuthority: current === undefined,
 			priority: current && !downshift ? Catalog.PRIORITY.video - 1 : Catalog.PRIORITY.video,
+			startGroup: history?.group,
 			sync: this.sync,
 			paced: this.in.paced,
 			broadcast: active,
@@ -273,7 +320,14 @@ export class Decoder {
 		const read = (track: DecoderTrack | undefined): TrackReceive | undefined => {
 			if (!track) return;
 			const progress = effect.get(track.received);
-			return progress && { ...progress, track: track.track, subscriptionId: track.subscriptionId };
+			return (
+				progress && {
+					...progress,
+					track: track.track,
+					subscriptionId: track.subscriptionId,
+					startGroup: track.startGroup,
+				}
+			);
 		};
 		this.#out.receive.set({ active: read(effect.get(this.#active)), pending: read(effect.get(this.#pending)) });
 	}
@@ -329,6 +383,7 @@ interface DecoderTrackProps {
 	failure: Signal<DecoderFailure | undefined>;
 	clockAuthority: boolean;
 	priority: number;
+	startGroup?: number;
 	sync: Sync;
 	paced: Getter<boolean>;
 	broadcast: Moq.Broadcast.Consumer;
@@ -361,6 +416,7 @@ class DecoderTrack {
 	downloadStopped = false;
 	#subscription?: Moq.Track.Subscriber;
 	#priority: number;
+	readonly startGroup?: number;
 
 	stopDownload(): void {
 		if (this.downloadStopped) return;
@@ -404,6 +460,7 @@ class DecoderTrack {
 		this.#failure = props.failure;
 		this.clockAuthority = props.clockAuthority;
 		this.#priority = props.priority;
+		this.startGroup = props.startGroup;
 		this.sync = props.sync;
 		this.paced = props.paced;
 		this.broadcast = props.broadcast;
@@ -420,7 +477,16 @@ class DecoderTrack {
 	}
 
 	#run(effect: Effect): void {
-		const sub = this.broadcast.track(this.track).subscribe({ priority: this.#priority });
+		const sub = this.broadcast.track(this.track).subscribe(
+			this.startGroup === undefined
+				? { priority: this.#priority }
+				: {
+						priority: this.#priority,
+						startGroup: this.startGroup,
+						ordered: true,
+						latencyMax: Math.min(2000, Math.ceil(this.sync.out.buffer.peek())),
+					},
+		);
 		this.#subscription = sub;
 		if (this.downloadStopped) {
 			sub.close();

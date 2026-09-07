@@ -180,3 +180,20 @@ Bytes include container headers, exclude transport overhead and retransmissions,
 and must not be treated as spare capacity. These are completed JavaScript reads,
 not packet arrival timestamps. A cancelled subscription disappears; reopening
 the same track gets a new identity and counters.
+
+## Replacement history
+
+When a paced downshift has a fresh timeline index, the player requests a recorded
+group at or before the outgoing picture's contiguous buffered tail. This can fill
+the media hole left by starting only at the latest group. It keeps metadata for
+at most eight previously selected renditions, with 64 records/eight seconds per
+index. It never assumes group numbers align between renditions.
+
+The lookup rejects stale indexes and requests no more than two seconds of media
+lookback. Replacement delivery starts in group order with a bounded latency
+budget, returning to normal live priority when it becomes active. Missing or
+unusable timelines retain latest-only delivery. A timeline is a compressed log;
+its initial metadata catchup depends on the publisher's log retention.
+
+`receive.active.startGroup` and `receive.pending.startGroup` identify a recorded
+history request. They are absent when delivery starts at the latest group.
