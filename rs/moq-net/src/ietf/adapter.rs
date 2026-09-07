@@ -1,6 +1,6 @@
 use std::{
 	collections::{HashMap, VecDeque},
-	sync::{Arc, Mutex},
+	sync::{Arc, Mutex, OnceLock},
 	task::Poll,
 };
 
@@ -115,14 +115,20 @@ pub struct VirtualRecvStream {
 	buffer: Bytes,
 	rx: Queue<Bytes>,
 	closed: bool,
+	shared: Arc<Shared>,
+	/// The request this stream serves, known up front when the peer opened it and
+	/// filled in by the first write when we did.
+	request_id: Arc<OnceLock<RequestId>>,
 }
 
 impl VirtualRecvStream {
-	fn new(initial: Bytes, rx: Queue<Bytes>) -> Self {
+	fn new(initial: Bytes, rx: Queue<Bytes>, shared: Arc<Shared>, request_id: Arc<OnceLock<RequestId>>) -> Self {
 		Self {
 			buffer: initial,
 			rx,
 			closed: false,
+			shared,
+			request_id,
 		}
 	}
 
@@ -206,6 +212,12 @@ impl Drop for VirtualRecvStream {
 		// The reader is gone: close the queue so routed follow-ups are discarded
 		// instead of buffering forever while the map entry lingers.
 		self.rx.close();
+
+		// Release the routing entries too, so a request torn down locally gives its
+		// namespace back and the same one can be advertised again.
+		if let Some(request_id) = self.request_id.get() {
+			self.shared.forget(*request_id);
+		}
 	}
 }
 
@@ -227,6 +239,9 @@ struct OutgoingRegistration {
 	shared: Arc<Shared>,
 	version: Version,
 	buf: BytesMut,
+	/// Shared with the matching [`VirtualRecvStream`] so it can release this request's
+	/// routing entries once the reader is dropped.
+	request_id: Arc<OnceLock<RequestId>>,
 }
 
 impl OutgoingRegistration {
@@ -258,7 +273,7 @@ impl OutgoingRegistration {
 				let _ = u64::decode(&mut cursor, self.version);
 			}
 			if let Ok(ns) = crate::ietf::namespace::decode_namespace(&mut cursor, self.version) {
-				self.shared.namespaces.insert(Direction::Outgoing, ns, request_id);
+				self.shared.namespaces.register(Direction::Outgoing, ns, request_id);
 			}
 		}
 
@@ -266,6 +281,7 @@ impl OutgoingRegistration {
 	}
 
 	fn register(self, request_id: RequestId) {
+		let _ = self.request_id.set(request_id);
 		self.shared.streams.lock().unwrap().insert(request_id, self.follow_tx);
 	}
 }
@@ -475,24 +491,60 @@ enum Direction {
 /// down the stream travelling the other way while its real target stayed open.
 #[derive(Default)]
 struct Namespaces {
-	outgoing: Mutex<HashMap<PathOwned, RequestId>>,
-	incoming: Mutex<HashMap<PathOwned, RequestId>>,
+	state: Mutex<NamespacesState>,
+}
+
+#[derive(Default)]
+struct NamespacesState {
+	outgoing: HashMap<PathOwned, RequestId>,
+	incoming: HashMap<PathOwned, RequestId>,
+
+	/// request_id → the namespace that request advertised, one entry per request
+	/// including a duplicate that lost, so [`Namespaces::forget`] releases only the
+	/// name its request owns. The two directions share this map because
+	/// moq-transport gives each peer its own request id space.
+	by_request: HashMap<RequestId, (Direction, PathOwned)>,
+}
+
+impl NamespacesState {
+	fn map(&mut self, direction: Direction) -> &mut HashMap<PathOwned, RequestId> {
+		match direction {
+			Direction::Outgoing => &mut self.outgoing,
+			Direction::Incoming => &mut self.incoming,
+		}
+	}
 }
 
 impl Namespaces {
-	fn map(&self, direction: Direction) -> &Mutex<HashMap<PathOwned, RequestId>> {
-		match direction {
-			Direction::Outgoing => &self.outgoing,
-			Direction::Incoming => &self.incoming,
-		}
-	}
-
-	fn insert(&self, direction: Direction, namespace: PathOwned, request_id: RequestId) {
-		self.map(direction).lock().unwrap().insert(namespace, request_id);
+	/// Record a request's namespace, leaving a live advertisement of the same name alone.
+	///
+	/// The first request in a direction owns the name until it ends. A peer that
+	/// advertises the same namespace twice would otherwise move the name onto the second
+	/// request, and the withdrawal it eventually names would close that one while the
+	/// first stayed open, advertised for the life of the session.
+	fn register(&self, direction: Direction, namespace: PathOwned, request_id: RequestId) {
+		let mut state = self.state.lock().unwrap();
+		state.by_request.insert(request_id, (direction, namespace.clone()));
+		state.map(direction).entry(namespace).or_insert(request_id);
 	}
 
 	fn get(&self, direction: Direction, namespace: &PathOwned) -> Option<RequestId> {
-		self.map(direction).lock().unwrap().get(namespace).copied()
+		self.state.lock().unwrap().map(direction).get(namespace).copied()
+	}
+
+	/// Release whatever a finished request holds, so its namespace can be advertised again.
+	fn forget(&self, request_id: RequestId) {
+		let mut state = self.state.lock().unwrap();
+		let Some((direction, namespace)) = state.by_request.remove(&request_id) else {
+			return;
+		};
+
+		// A duplicate that lost carries the same name as the request holding it; releasing
+		// on its behalf would strand the holder, whose withdrawal would resolve to nothing.
+		let map = state.map(direction);
+		if map.get(&namespace) == Some(&request_id) {
+			map.remove(&namespace);
+		}
 	}
 }
 
@@ -518,7 +570,8 @@ impl Shared {
 	/// until the first write reveals the request_id.
 	fn open_outgoing(self: &Arc<Self>, version: Version) -> (VirtualSendStream, VirtualRecvStream) {
 		let follow = Queue::new();
-		let recv = VirtualRecvStream::new(Bytes::new(), follow.clone());
+		let request_id = Arc::new(OnceLock::new());
+		let recv = VirtualRecvStream::new(Bytes::new(), follow.clone(), Arc::clone(self), Arc::clone(&request_id));
 		let send = VirtualSendStream::with_registration(
 			self.control.clone(),
 			OutgoingRegistration {
@@ -526,15 +579,16 @@ impl Shared {
 				shared: Arc::clone(self),
 				version,
 				buf: BytesMut::new(),
+				request_id,
 			},
 		);
 		(send, recv)
 	}
 
 	/// Register the peer's new request and queue its stream for accept_bi.
-	fn open_incoming(&self, request_id: RequestId, raw: Bytes) -> Result<(), Error> {
+	fn open_incoming(self: &Arc<Self>, request_id: RequestId, raw: Bytes) -> Result<(), Error> {
 		let follow = Queue::new();
-		let recv = VirtualRecvStream::new(raw, follow.clone());
+		let recv = VirtualRecvStream::new(raw, follow.clone(), Arc::clone(self), Arc::new(request_id.into()));
 		let send = VirtualSendStream::new(self.control.clone());
 		self.streams.lock().unwrap().insert(request_id, follow.writer());
 		if !self.incoming.push((send, recv)) {
@@ -552,9 +606,17 @@ impl Shared {
 
 	/// Deliver a final message and FIN the stream: the removed writer drops after it.
 	fn close(&self, request_id: RequestId, raw: Bytes) {
-		if let Some(tx) = self.streams.lock().unwrap().remove(&request_id) {
+		let tx = self.streams.lock().unwrap().remove(&request_id);
+		self.namespaces.forget(request_id);
+		if let Some(tx) = tx {
 			tx.push(raw);
 		}
+	}
+
+	/// Drop every routing entry a request owns, whether or not its stream is still around.
+	fn forget(&self, request_id: RequestId) {
+		self.streams.lock().unwrap().remove(&request_id);
+		self.namespaces.forget(request_id);
 	}
 }
 
@@ -645,6 +707,7 @@ impl<S: web_transport_trait::Session> ControlStreamAdapter<S> {
 				Route::Response(request_id) | Route::FollowUp(request_id) => self.shared.push(request_id, raw),
 				Route::CloseStream(request_id) => self.shared.close(request_id, raw),
 				Route::MaxRequestId(max) => self.control.max_request_id(max),
+				Route::Ignore => {}
 				Route::GoAway => return Err(Error::Unsupported),
 			}
 		}
@@ -674,7 +737,7 @@ fn classify(type_id: u64, body: &Bytes, version: Version, namespaces: &Namespace
 			let id = decode_request_id(body, version)?;
 			// Decode the namespace and store the mapping for v14/v15 reverse lookup
 			if let Ok(ns) = decode_publish_namespace_body(body, version) {
-				namespaces.insert(Direction::Incoming, ns, id);
+				namespaces.register(Direction::Incoming, ns, id);
 			}
 			Ok(Route::NewRequest(id))
 		}
@@ -800,8 +863,10 @@ fn classify(type_id: u64, body: &Bytes, version: Version, namespaces: &Namespace
 			// DONE withdraws the advertisement its sender made, so it names an
 			// inbound one.
 			Version::Draft14 | Version::Draft15 => {
-				let id = lookup_namespace_request_id(body, version, namespaces, Direction::Incoming)?;
-				Ok(Route::CloseStream(id))
+				match lookup_namespace_request_id(body, version, namespaces, Direction::Incoming)? {
+					Some(id) => Ok(Route::CloseStream(id)),
+					None => Ok(Route::Ignore),
+				}
 			}
 			_ => Err(Error::UnexpectedMessage),
 		},
@@ -813,8 +878,10 @@ fn classify(type_id: u64, body: &Bytes, version: Version, namespaces: &Namespace
 			// v14/v15: namespace-keyed. CANCEL rejects an advertisement its sender
 			// received, so it names an outbound one.
 			Version::Draft14 | Version::Draft15 => {
-				let id = lookup_namespace_request_id(body, version, namespaces, Direction::Outgoing)?;
-				Ok(Route::CloseStream(id))
+				match lookup_namespace_request_id(body, version, namespaces, Direction::Outgoing)? {
+					Some(id) => Ok(Route::CloseStream(id)),
+					None => Ok(Route::Ignore),
+				}
 			}
 			_ => Err(Error::UnexpectedMessage),
 		},
@@ -842,15 +909,22 @@ fn classify(type_id: u64, body: &Bytes, version: Version, namespaces: &Namespace
 
 /// Decode the namespace from a v14/v15 namespace-keyed message body and look up the
 /// request_id of the advertisement it terminates, travelling in the given direction.
+///
+/// `None` when nothing holds that name: the request it named is already gone. There is
+/// nothing left to close, so the message is dropped rather than ending the session.
 fn lookup_namespace_request_id(
 	body: &Bytes,
 	version: Version,
 	namespaces: &Namespaces,
 	direction: Direction,
-) -> Result<RequestId, Error> {
+) -> Result<Option<RequestId>, Error> {
 	let mut cursor = std::io::Cursor::new(body);
 	let ns = crate::ietf::namespace::decode_namespace(&mut cursor, version)?;
-	namespaces.get(direction, &ns).ok_or(Error::NotFound)
+	let request_id = namespaces.get(direction, &ns);
+	if request_id.is_none() {
+		tracing::warn!(namespace = %ns, ?direction, "no advertisement to withdraw");
+	}
+	Ok(request_id)
 }
 
 impl<S: web_transport_trait::Session> web_transport_trait::Session for ControlStreamAdapter<S> {
@@ -941,6 +1015,8 @@ enum Route {
 	FollowUp(RequestId),
 	CloseStream(RequestId),
 	MaxRequestId(RequestId),
+	/// Nothing to route: the message named a request that is already gone.
+	Ignore,
 	GoAway,
 }
 
@@ -995,6 +1071,11 @@ mod tests {
 	/// Classify against an empty namespace map, for the messages that don't use it.
 	fn classify_msg(version: Version, type_id: u64, body: &Bytes) -> Result<Route, Error> {
 		classify(type_id, body, version, &Namespaces::default())
+	}
+
+	/// A receive stream with no request behind it, for exercising the reader alone.
+	fn detached_recv(initial: Bytes, rx: Queue<Bytes>) -> VirtualRecvStream {
+		VirtualRecvStream::new(initial, rx, Arc::new(Shared::default()), Arc::new(OnceLock::new()))
 	}
 
 	#[test]
@@ -1107,7 +1188,7 @@ mod tests {
 		let initial = Bytes::from_static(b"initial");
 		let follow = Queue::new();
 		let tx = follow.writer();
-		let mut stream = VirtualRecvStream::new(initial, follow);
+		let mut stream = detached_recv(initial, follow);
 
 		// Read initial data
 		let mut buf = [0u8; 32];
@@ -1128,7 +1209,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_virtual_recv_stream_partial_reads() {
 		let initial = Bytes::from_static(b"hello world");
-		let mut stream = VirtualRecvStream::new(initial, Queue::new());
+		let mut stream = detached_recv(initial, Queue::new());
 
 		// Read small chunks
 		let mut buf = [0u8; 5];
@@ -1158,7 +1239,7 @@ mod tests {
 		// Dropping the reader closes the queue, so late routed messages are
 		// discarded instead of accumulating while the map entry lingers.
 		let follow = Queue::new();
-		let stream = VirtualRecvStream::new(Bytes::new(), follow.clone());
+		let stream = detached_recv(Bytes::new(), follow.clone());
 		drop(stream);
 		assert!(!follow.push(Bytes::from_static(b"late")));
 	}
@@ -1196,18 +1277,28 @@ mod tests {
 		}
 	}
 
-	/// Advertise `namespace` to the peer on request 4, as `open_bi` + a write would.
-	async fn advertise(shared: &Arc<Shared>, namespace: &str, version: Version) -> VirtualRecvStream {
+	/// Advertise `namespace` to the peer on `request_id`, as `open_bi` + a write would.
+	async fn advertise(
+		shared: &Arc<Shared>,
+		namespace: &str,
+		version: Version,
+		request_id: RequestId,
+	) -> VirtualRecvStream {
 		let (mut send, recv) = shared.open_outgoing(version);
-		send.write_chunk(encode_msg(&publish_namespace(RequestId(4), namespace), version))
+		send.write_chunk(encode_msg(&publish_namespace(request_id, namespace), version))
 			.await
 			.unwrap();
 		recv
 	}
 
-	/// Receive the peer's advertisement of `namespace` on request 7, as the read loop would.
-	async fn receive(shared: &Arc<Shared>, namespace: &str, version: Version) -> VirtualRecvStream {
-		let msg = publish_namespace(RequestId(7), namespace);
+	/// Receive the peer's advertisement of `namespace` on `request_id`, as the read loop would.
+	async fn receive(
+		shared: &Arc<Shared>,
+		namespace: &str,
+		version: Version,
+		request_id: RequestId,
+	) -> VirtualRecvStream {
+		let msg = publish_namespace(request_id, namespace);
 		let route = classify(
 			ietf::PublishNamespace::ID,
 			&encode_body(&msg, version),
@@ -1215,8 +1306,8 @@ mod tests {
 			&shared.namespaces,
 		)
 		.unwrap();
-		assert!(matches!(route, Route::NewRequest(RequestId(7))));
-		shared.open_incoming(RequestId(7), encode_msg(&msg, version)).unwrap();
+		assert!(matches!(route, Route::NewRequest(id) if id == request_id));
+		shared.open_incoming(request_id, encode_msg(&msg, version)).unwrap();
 
 		let (_, mut recv) = shared.incoming.pop().await.unwrap();
 
@@ -1244,12 +1335,12 @@ mod tests {
 
 		let (ours, theirs) = match last {
 			Direction::Outgoing => {
-				let theirs = receive(&shared, namespace, version).await;
-				(advertise(&shared, namespace, version).await, theirs)
+				let theirs = receive(&shared, namespace, version, RequestId(7)).await;
+				(advertise(&shared, namespace, version, RequestId(4)).await, theirs)
 			}
 			Direction::Incoming => {
-				let ours = advertise(&shared, namespace, version).await;
-				(ours, receive(&shared, namespace, version).await)
+				let ours = advertise(&shared, namespace, version, RequestId(4)).await;
+				(ours, receive(&shared, namespace, version, RequestId(7)).await)
 			}
 		};
 
@@ -1269,7 +1360,7 @@ mod tests {
 	#[test]
 	fn test_namespace_reverse_lookup_v14() {
 		let namespaces = Namespaces::default();
-		namespaces.insert(Direction::Incoming, crate::Path::new("test/ns"), RequestId(42));
+		namespaces.register(Direction::Incoming, crate::Path::new("test/ns"), RequestId(42));
 
 		let body = encode_body(
 			&ietf::PublishNamespaceDone {
@@ -1335,5 +1426,114 @@ mod tests {
 		assert!(drained(&mut ours, 4).await);
 		assert!(shared.streams.lock().unwrap().contains_key(&RequestId(7)));
 		assert!(theirs.read_chunk(usize::MAX).now_or_never().is_none());
+	}
+
+	/// Classify the peer withdrawing its own advertisement of `namespace`.
+	fn done(shared: &Arc<Shared>, namespace: &str, version: Version) -> Route {
+		let msg = ietf::PublishNamespaceDone {
+			track_namespace: crate::Path::new(namespace),
+			request_id: RequestId(0),
+		};
+		classify(
+			ietf::PublishNamespaceDone::ID,
+			&encode_body(&msg, version),
+			version,
+			&shared.namespaces,
+		)
+		.unwrap()
+	}
+
+	/// Classify the peer rejecting our advertisement of `namespace`.
+	fn cancel(shared: &Arc<Shared>, namespace: &str, version: Version) -> Route {
+		let msg = ietf::PublishNamespaceCancel {
+			track_namespace: crate::Path::new(namespace),
+			request_id: RequestId(0),
+			error_code: 0,
+			reason_phrase: "".into(),
+		};
+		classify(
+			ietf::PublishNamespaceCancel::ID,
+			&encode_body(&msg, version),
+			version,
+			&shared.namespaces,
+		)
+		.unwrap()
+	}
+
+	#[tokio::test]
+	async fn test_duplicate_publish_namespace_keeps_the_first() {
+		// The peer advertises the same namespace twice. The session refuses the second, so
+		// the first still owns the name and its withdrawal must reach the first's stream.
+		let version = Version::Draft14;
+		let shared = Arc::new(Shared::default());
+		let first = receive(&shared, "cluster/ns", version, RequestId(7)).await;
+		let duplicate = receive(&shared, "cluster/ns", version, RequestId(11)).await;
+
+		assert!(matches!(
+			done(&shared, "cluster/ns", version),
+			Route::CloseStream(RequestId(7))
+		));
+
+		// Tearing down the refused duplicate releases only what it owns, which is nothing.
+		drop(duplicate);
+		assert!(matches!(
+			done(&shared, "cluster/ns", version),
+			Route::CloseStream(RequestId(7))
+		));
+
+		// The winner going away is what frees the name.
+		drop(first);
+		assert!(matches!(done(&shared, "cluster/ns", version), Route::Ignore));
+	}
+
+	#[tokio::test]
+	async fn test_withdrawal_releases_the_namespace() {
+		// A namespace the peer withdraws must be advertisable again on a new request.
+		let version = Version::Draft14;
+		let shared = Arc::new(Shared::default());
+		let mut theirs = receive(&shared, "cluster/ns", version, RequestId(7)).await;
+
+		let msg = ietf::PublishNamespaceDone {
+			track_namespace: crate::Path::new("cluster/ns"),
+			request_id: RequestId(0),
+		};
+		shared.close(RequestId(7), encode_msg(&msg, version));
+		assert!(drained(&mut theirs, 4).await);
+		assert!(!shared.streams.lock().unwrap().contains_key(&RequestId(7)));
+
+		let _again = receive(&shared, "cluster/ns", version, RequestId(11)).await;
+		assert!(matches!(
+			done(&shared, "cluster/ns", version),
+			Route::CloseStream(RequestId(11))
+		));
+	}
+
+	#[tokio::test]
+	async fn test_local_withdrawal_releases_the_namespace() {
+		// We withdraw our own advertisement by dropping the request that carried it, so a
+		// later CANCEL must name the re-advertisement rather than the request that is gone.
+		let version = Version::Draft14;
+		let shared = Arc::new(Shared::default());
+
+		let ours = advertise(&shared, "cluster/ns", version, RequestId(4)).await;
+		drop(ours);
+		assert!(matches!(cancel(&shared, "cluster/ns", version), Route::Ignore));
+
+		let _again = advertise(&shared, "cluster/ns", version, RequestId(6)).await;
+		assert!(matches!(
+			cancel(&shared, "cluster/ns", version),
+			Route::CloseStream(RequestId(6))
+		));
+	}
+
+	#[test]
+	fn test_unresolvable_withdrawal_is_dropped() {
+		// v14/v15 name their withdrawals, and a name we hold no advertisement for belongs
+		// to a request that is already gone. Dropping it beats ending the session.
+		for version in [Version::Draft14, Version::Draft15] {
+			let shared = Arc::new(Shared::default());
+			assert!(matches!(done(&shared, "cluster/ns", version), Route::Ignore));
+			assert!(matches!(cancel(&shared, "cluster/ns", version), Route::Ignore));
+		}
 	}
 }

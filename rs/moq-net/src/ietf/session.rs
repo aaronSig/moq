@@ -984,4 +984,103 @@ mod tests {
 	async fn a_bidi_stream_dead_before_its_header_does_not_end_the_session() {
 		a_dead_incoming_stream_is_not_fatal(crate::lite::test_transport::DeadStreamSession::bis(1)).await;
 	}
+
+	/// A peer's advertisement of `room/host`, then two namespace-keyed withdrawals of it.
+	/// The second has no advertisement left to name.
+	async fn publish_namespace_then_two_withdrawals(version: Version) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+
+		writer.encode(&ietf::PublishNamespace::ID).await.unwrap();
+		writer
+			.encode(&ietf::PublishNamespace {
+				request_id: RequestId(1),
+				track_namespace: crate::Path::new("room/host"),
+				cluster: None,
+			})
+			.await
+			.unwrap();
+
+		for _ in 0..2 {
+			writer.encode(&ietf::PublishNamespaceDone::ID).await.unwrap();
+			writer
+				.encode(&ietf::PublishNamespaceDone {
+					track_namespace: crate::Path::new("room/host"),
+					request_id: RequestId(0),
+				})
+				.await
+				.unwrap();
+		}
+
+		let writes = log.writes.lock().unwrap();
+		writes.clone()
+	}
+
+	/// The acknowledgement draft-14 answers a PUBLISH_NAMESPACE with, as bytes to look
+	/// for in what we wrote.
+	async fn publish_namespace_ok(request_id: RequestId) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(
+			crate::lite::test_transport::SinkSend::new(log.clone()),
+			Version::Draft14,
+		);
+
+		writer.encode(&ietf::PublishNamespaceOk::ID).await.unwrap();
+		writer.encode(&ietf::PublishNamespaceOk { request_id }).await.unwrap();
+
+		let writes = log.writes.lock().unwrap();
+		writes.clone()
+	}
+
+	/// draft-14 names its withdrawals rather than numbering them, so a repeat has no
+	/// advertisement left to resolve to. Dropping it is what keeps the session up: failing
+	/// the lookup takes the whole connection down over a message with nothing left to do.
+	///
+	/// Driven through `start` because only the full loop shows the consequence, the read
+	/// task propagating the classifier's error.
+	#[tokio::test]
+	async fn a_repeated_publish_namespace_done_does_not_end_the_session() {
+		const VERSION: Version = Version::Draft14;
+
+		let origin = crate::origin::Info::new(crate::Origin::new(1).unwrap()).produce();
+		let consumer = origin.consume();
+
+		let session =
+			crate::lite::test_transport::ScriptedSession::new(publish_namespace_then_two_withdrawals(VERSION).await);
+		let log = session.log.clone();
+		let setup = Stream::open(&session, VERSION).await.expect("open the control stream");
+
+		let driver = start(Config {
+			session,
+			setup: Some(setup),
+			request_id_max: None,
+			client: true,
+			publish: None,
+			subscribe: Some(origin),
+			peer_origin: None,
+			cost: None,
+			version: VERSION,
+			path: None,
+			peer_setup_stream: None,
+			peer_declared: None,
+		})
+		.expect("start the session");
+		let driver = tokio::spawn(driver);
+
+		let accepted = publish_namespace_ok(RequestId(1)).await;
+		for _ in 0..ANNOUNCE_TURNS {
+			if occurrences(&log, &accepted) > 0 && consumer.get_broadcast("room/host").is_none() {
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		}
+
+		assert_eq!(occurrences(&log, &accepted), 1, "the advertisement was not accepted");
+		assert!(
+			consumer.get_broadcast("room/host").is_none(),
+			"the withdrawal did not reach the request that advertised it"
+		);
+		assert!(!driver.is_finished(), "the repeated withdrawal ended the session");
+		assert!(log.closes().is_empty(), "closed the session: {:?}", log.closes());
+	}
 }
