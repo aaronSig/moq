@@ -1016,12 +1016,15 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			stream.writer.encode(&lite::SubscribeResponse::Ok(info)).await?;
 		}
 
-		// Track-level subscriber priority. SUBSCRIBE_UPDATE messages broadcast new values
+		// Subscriber delivery preferences. SUBSCRIBE_UPDATE messages broadcast new values
 		// to both run_track (so future groups inherit the new priority) and serve_group
-		// tasks (so in-flight groups update via PriorityHandle::set_track). The producer
+		// tasks (so in-flight groups update via PriorityHandle::set_delivery). The producer
 		// stays in run_subscribe and gets handed to run_track so the same loop that
 		// parses SUBSCRIBE_UPDATEs also fans the new priority out.
-		let track_priority_tx = kio::Producer::new(subscribe.priority);
+		let track_priority_tx = kio::Producer::new(Delivery {
+			priority: subscribe.priority,
+			ordered: subscribe.ordered,
+		});
 
 		let sub = Subscription {
 			session,
@@ -1029,7 +1032,10 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			track_name: Arc::from(track.name()),
 			priority,
 			track_priority: track_priority_tx.consume(),
-			track_priority_seen: subscribe.priority,
+			track_priority_seen: Delivery {
+				priority: subscribe.priority,
+				ordered: subscribe.ordered,
+			},
 			version,
 			timescale,
 		};
@@ -1963,6 +1969,14 @@ async fn recv_next(track: &mut track::Subscriber, datagrams: bool, emit_boundary
 	kio::wait(|waiter| poll_recv_next(track, datagrams, emit_boundary, waiter)).await
 }
 
+/// Preferences that affect transport scheduling. Every in-flight group observes
+/// them together, including while waiting for payload bytes or FIN acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Delivery {
+	priority: u8,
+	ordered: bool,
+}
+
 /// Shared per-subscription state for the publisher side. Cloned cheaply. Every
 /// field is either small or already Arc-backed for each in-flight serve_group task
 /// so each in-flight group reads the latest SUBSCRIBE_UPDATE priority via its own
@@ -1973,9 +1987,9 @@ struct Subscription<S: web_transport_trait::Session> {
 	id: u64,
 	track_name: Arc<str>,
 	priority: PriorityQueue,
-	track_priority: kio::Consumer<u8>,
-	/// Last track priority observed by this clone, so a change only fires once.
-	track_priority_seen: u8,
+	track_priority: kio::Consumer<Delivery>,
+	/// Last delivery preferences observed by this clone, so a change only fires once.
+	track_priority_seen: Delivery,
 	version: Version,
 	/// Negotiated timestamp scale for this track. `Some(_)` on lite-05+ after
 	/// TRACK_INFO; used to validate per-frame timestamps before encoding.
@@ -1990,7 +2004,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		initial_end_group: Option<u64>,
 		reader: &mut crate::coding::Reader<S::RecvStream, Version>,
 		writer: &mut Writer<S::SendStream, Version>,
-		track_priority_tx: &kio::Producer<u8>,
+		track_priority_tx: &kio::Producer<Delivery>,
 	) -> Result<(), Error> {
 		let mut tasks: FuturesUnordered<MaybeSendBox<'static, ()>> = FuturesUnordered::new();
 
@@ -2111,11 +2125,14 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 
 	fn apply_subscribe_update(
 		track: &mut track::Subscriber,
-		priority_tx: &kio::Producer<u8>,
+		priority_tx: &kio::Producer<Delivery>,
 		upd: lite::SubscribeUpdate,
 	) {
 		if let Ok(mut value) = priority_tx.write() {
-			*value = upd.priority;
+			*value = Delivery {
+				priority: upd.priority,
+				ordered: upd.ordered,
+			};
 		}
 		let _ = track.update(crate::track::Subscription {
 			priority: upd.priority,
@@ -2140,7 +2157,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		reader: &mut crate::coding::Reader<S::RecvStream, Version>,
 		writer: &mut Writer<S::SendStream, Version>,
 		tasks: &mut FuturesUnordered<MaybeSendBox<'static, ()>>,
-		priority_tx: &kio::Producer<u8>,
+		priority_tx: &kio::Producer<Delivery>,
 	) -> Result<(), Error> {
 		enum Event {
 			Update(Result<Option<lite::SubscribeUpdate>, Error>),
@@ -2177,7 +2194,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		track: &mut track::Subscriber,
 		reader: &mut crate::coding::Reader<S::RecvStream, Version>,
 		tasks: &mut FuturesUnordered<MaybeSendBox<'static, ()>>,
-		priority_tx: &kio::Producer<u8>,
+		priority_tx: &kio::Producer<Delivery>,
 	) -> Result<(), Error> {
 		loop {
 			let event = {
@@ -2210,7 +2227,9 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 
 		// Use the latest priority for new groups so SUBSCRIBE_UPDATE applies to them too.
 		let current_priority = self.track_priority_current();
-		let handle = self.priority.insert(Priority::new(current_priority, sequence));
+		let handle = self
+			.priority
+			.insert(Priority::new(current_priority.priority, sequence).with_ordered(current_priority.ordered));
 		let fut = self.clone().serve_group(sequence, handle, group);
 		tasks.push(fut.map(|_| ()).maybe_boxed());
 	}
@@ -2250,7 +2269,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 					}
 				}) {
 					self.track_priority_seen = value;
-					priority.set_track(value);
+					priority.set_delivery(value.priority, value.ordered);
 				}
 				priority.poll_next(waiter).map(|_| priority.send_order())
 			})
@@ -2445,8 +2464,8 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 	async fn serve_step<T>(
 		stream: &mut Writer<S::SendStream, Version>,
 		priority: &mut PriorityHandle,
-		track_priority: &kio::Consumer<u8>,
-		track_priority_seen: &mut u8,
+		track_priority: &kio::Consumer<Delivery>,
+		track_priority_seen: &mut Delivery,
 		mut work: impl FnMut(&kio::Waiter) -> Poll<Result<T, Error>>,
 	) -> Result<T, Error> {
 		enum Event<T> {
@@ -2455,7 +2474,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 			/// The handle's rank changed; the new value is re-read via
 			/// [`PriorityHandle::send_order`] when handled.
 			Priority,
-			TrackPriority(u8),
+			TrackPriority(Delivery),
 		}
 
 		loop {
@@ -2493,14 +2512,14 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 				Event::Priority => stream.set_priority(priority.send_order()),
 				Event::TrackPriority(new_track) => {
 					*track_priority_seen = new_track;
-					priority.set_track(new_track);
+					priority.set_delivery(new_track.priority, new_track.ordered);
 				}
 			}
 		}
 	}
 
 	/// Read the latest SUBSCRIBE_UPDATE track priority, marking it seen.
-	fn track_priority_current(&mut self) -> u8 {
+	fn track_priority_current(&mut self) -> Delivery {
 		self.track_priority_seen = *self.track_priority.read();
 		self.track_priority_seen
 	}
@@ -2519,7 +2538,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 			enum Event {
 				Written(Result<usize, Error>),
 				Rank,
-				Track(u8),
+				Track(Delivery),
 			}
 			let event = {
 				let mut write = std::pin::pin!(stream.write(&mut chunk));
@@ -2548,7 +2567,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 				Event::Rank => {}
 				Event::Track(value) => {
 					self.track_priority_seen = value;
-					priority.set_track(value);
+					priority.set_delivery(value.priority, value.ordered);
 				}
 			}
 		}
@@ -2557,7 +2576,7 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 
 	fn apply_priority(&mut self, stream: &mut Writer<S::SendStream, Version>, priority: &mut PriorityHandle) {
 		let track_priority = self.track_priority_current();
-		priority.set_track(track_priority);
+		priority.set_delivery(track_priority.priority, track_priority.ordered);
 		stream.set_priority(priority.send_order());
 	}
 }
@@ -2580,7 +2599,10 @@ mod serve_group_test {
 		let session = SinkSession::gated_uni(gate.consume());
 		let log = session.log.clone();
 		let mut writer = Writer::new(session.open_uni().await.unwrap(), Version::Lite06Wip);
-		let track_priority = kio::Producer::new(50u8);
+		let track_priority = kio::Producer::new(Delivery {
+			priority: 50,
+			ordered: false,
+		});
 		let queue = PriorityQueue::default();
 		let mut handle = queue.insert(Priority::new(50, 1));
 		let mut subscription = Subscription {
@@ -2589,7 +2611,10 @@ mod serve_group_test {
 			track_name: "test".into(),
 			priority: queue.clone(),
 			track_priority: track_priority.consume(),
-			track_priority_seen: 50,
+			track_priority_seen: Delivery {
+				priority: 50,
+				ordered: false,
+			},
 			version: Version::Lite06Wip,
 			timescale: None,
 		};
@@ -2619,7 +2644,10 @@ mod serve_group_test {
 		let session = SinkSession::gated_uni(gate.consume());
 		let log = session.log.clone();
 		let mut writer = Writer::new(session.open_uni().await.unwrap(), Version::Lite06Wip);
-		let track_priority = kio::Producer::new(50u8);
+		let track_priority = kio::Producer::new(Delivery {
+			priority: 50,
+			ordered: false,
+		});
 		let queue = PriorityQueue::default();
 		let _other = queue.insert(Priority::new(60, 1));
 		let mut handle = queue.insert(Priority::new(50, 1));
@@ -2629,7 +2657,10 @@ mod serve_group_test {
 			track_name: "test".into(),
 			priority: queue,
 			track_priority: track_priority.consume(),
-			track_priority_seen: 50,
+			track_priority_seen: Delivery {
+				priority: 50,
+				ordered: false,
+			},
 			version: Version::Lite06Wip,
 			timescale: None,
 		};
@@ -2637,7 +2668,7 @@ mod serve_group_test {
 			std::pin::pin!(subscription.write_chunk(&mut writer, &mut handle, bytes::Bytes::from_static(b"hello")));
 		assert!(futures::poll!(send.as_mut()).is_pending());
 		assert_eq!(log.priorities().last(), Some(&254));
-		*track_priority.write().ok().unwrap() = 70;
+		track_priority.write().ok().unwrap().priority = 70;
 		assert!(futures::poll!(send.as_mut()).is_pending());
 		assert_eq!(
 			log.priorities().last(),
@@ -2654,14 +2685,20 @@ mod serve_group_test {
 		let log = Log::default();
 		let session = SinkSession::new(log.clone());
 
-		let track_priority = kio::Producer::new(0u8);
+		let track_priority = kio::Producer::new(Delivery {
+			priority: 0,
+			ordered: false,
+		});
 		let subscription = Subscription {
 			session,
 			id: 0,
 			track_name: "test".into(),
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
-			track_priority_seen: 0,
+			track_priority_seen: Delivery {
+				priority: 0,
+				ordered: false,
+			},
 			version: Version::Lite06Wip,
 			timescale: Some(crate::Timescale::default()),
 		};
@@ -2695,14 +2732,20 @@ mod serve_group_test {
 		const PAYLOAD: usize = 7;
 
 		fn subscription(log: &Log) -> Subscription<SinkSession> {
-			let track_priority = kio::Producer::new(0u8);
+			let track_priority = kio::Producer::new(Delivery {
+				priority: 0,
+				ordered: false,
+			});
 			Subscription {
 				session: SinkSession::new(log.clone()),
 				id: 0,
 				track_name: "test".into(),
 				priority: PriorityQueue::default(),
 				track_priority: track_priority.consume(),
-				track_priority_seen: 0,
+				track_priority_seen: Delivery {
+					priority: 0,
+					ordered: false,
+				},
 				version: Version::Lite06Wip,
 				timescale: Some(crate::Timescale::default()),
 			}
@@ -2782,14 +2825,20 @@ mod serve_group_test {
 		let log = Log::default();
 		let session = SinkSession::new(log.clone());
 
-		let track_priority = kio::Producer::new(0u8);
+		let track_priority = kio::Producer::new(Delivery {
+			priority: 0,
+			ordered: false,
+		});
 		let subscription = Subscription {
 			session,
 			id: 0,
 			track_name: "test".into(),
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
-			track_priority_seen: 0,
+			track_priority_seen: Delivery {
+				priority: 0,
+				ordered: false,
+			},
 			version: Version::Lite06Wip,
 			timescale: Some(crate::Timescale::default()),
 		};
@@ -2828,14 +2877,20 @@ mod serve_group_test {
 		let log = Log::default();
 		let session = SinkSession::new(log.clone());
 
-		let track_priority = kio::Producer::new(0u8);
+		let track_priority = kio::Producer::new(Delivery {
+			priority: 0,
+			ordered: false,
+		});
 		let subscription = Subscription {
 			session,
 			id: 0,
 			track_name: "test".into(),
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
-			track_priority_seen: 0,
+			track_priority_seen: Delivery {
+				priority: 0,
+				ordered: false,
+			},
 			version: Version::Lite06Wip,
 			timescale: Some(crate::Timescale::default()),
 		};
@@ -2879,18 +2934,27 @@ mod serve_group_test {
 	/// group here runs longer than one batch.
 	#[tokio::test(start_paused = true)]
 	async fn stalled_write_releases_the_group() {
+		stalled_write_expiry(false).await;
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn ordered_stalled_write_releases_the_group() {
+		stalled_write_expiry(true).await;
+	}
+
+	async fn stalled_write_expiry(ordered: bool) {
 		let gate = kio::Producer::new(true);
 		let session = SinkSession::gated_uni(gate.consume());
 		let log = session.log.clone();
 
-		let track_priority = kio::Producer::new(0u8);
+		let track_priority = kio::Producer::new(Delivery { priority: 0, ordered });
 		let subscription = Subscription {
 			session,
 			id: 0,
 			track_name: "test".into(),
 			priority: PriorityQueue::default(),
 			track_priority: track_priority.consume(),
-			track_priority_seen: 0,
+			track_priority_seen: Delivery { priority: 0, ordered },
 			version: Version::Lite06Wip,
 			timescale: Some(crate::Timescale::default()),
 		};
@@ -2908,7 +2972,7 @@ mod serve_group_test {
 			.finish()
 			.unwrap();
 
-		let handle = subscription.priority.insert(Priority::new(0, 0));
+		let handle = subscription.priority.insert(Priority::new(0, 0).with_ordered(ordered));
 		let mut serve = std::pin::pin!(subscription.serve_group(0, handle, group.consume()));
 
 		// Write the header and the first frame, leaving the task awaiting the next.
@@ -3394,14 +3458,20 @@ mod control_liveness_tests {
 		let (send, recv) = session.open_bi().await.unwrap();
 		let mut writer = Writer::new(send, Version::Lite05);
 		let mut reader = Reader::new(recv, Version::Lite05);
-		let priority = kio::Producer::new(50u8);
+		let priority = kio::Producer::new(Delivery {
+			priority: 50,
+			ordered: false,
+		});
 		let subscription = Subscription {
 			session,
 			id: 1,
 			track_name: "trial".into(),
 			priority: PriorityQueue::default(),
 			track_priority: priority.consume(),
-			track_priority_seen: 50,
+			track_priority_seen: Delivery {
+				priority: 50,
+				ordered: false,
+			},
 			version: Version::Lite05,
 			timescale: Some(crate::Timescale::default()),
 		};
@@ -3480,7 +3550,10 @@ mod control_liveness_tests {
 		let (send, recv) = session.open_bi().await.unwrap();
 		let mut writer = Writer::new(send, Version::Lite05);
 		let mut reader = Reader::new(recv, Version::Lite05);
-		let priority = kio::Producer::new(50u8);
+		let priority = kio::Producer::new(Delivery {
+			priority: 50,
+			ordered: false,
+		});
 		let producer = track::Producer::new(Arc::new(crate::broadcast::Info::default()), "trial", None);
 		let mut track = producer.subscribe(crate::track::Subscription::default());
 		let mut tasks = FuturesUnordered::new();
@@ -3509,10 +3582,16 @@ mod control_liveness_tests {
 		update.encode(&mut bytes, Version::Lite05).unwrap();
 		input.write().ok().unwrap().bytes.push(bytes[0]);
 		assert!(futures::poll!(work.as_mut()).is_pending());
-		assert_eq!(*priority.read(), 50, "partial update must not apply");
+		assert_eq!(priority.read().priority, 50, "partial update must not apply");
+		assert!(!priority.read().ordered);
 		input.write().ok().unwrap().bytes.extend_from_slice(&bytes[1..]);
 		assert!(futures::poll!(work.as_mut()).is_pending());
-		assert_eq!(*priority.read(), 80, "priority must apply before output unblocks");
+		assert_eq!(
+			priority.read().priority,
+			80,
+			"priority must apply before output unblocks"
+		);
+		assert!(priority.read().ordered);
 		*budget.write().ok().unwrap() = usize::MAX;
 		assert!(matches!(futures::poll!(work.as_mut()), Poll::Ready(Ok(()))));
 		drop(work);
@@ -3543,14 +3622,20 @@ mod control_liveness_tests {
 		let (send, recv) = session.open_bi().await.unwrap();
 		let mut writer = Writer::new(send, Version::Lite05);
 		let mut reader = Reader::new(recv, Version::Lite05);
-		let priority = kio::Producer::new(50u8);
+		let priority = kio::Producer::new(Delivery {
+			priority: 50,
+			ordered: false,
+		});
 		let subscription = Subscription {
 			session,
 			id: 1,
 			track_name: "trial".into(),
 			priority: PriorityQueue::default(),
 			track_priority: priority.consume(),
-			track_priority_seen: 50,
+			track_priority_seen: Delivery {
+				priority: 50,
+				ordered: false,
+			},
 			version: Version::Lite05,
 			timescale: Some(crate::Timescale::default()),
 		};
