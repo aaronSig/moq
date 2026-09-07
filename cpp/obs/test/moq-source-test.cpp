@@ -917,6 +917,8 @@ bool allTerminated()
 
 void reset()
 {
+	// The source can release its last reference before the stub finishes terminal bookkeeping.
+	g_runtime->Run([] {});
 	{
 		std::lock_guard<std::mutex> lock(g_subs_mutex);
 		g_subs.clear();
