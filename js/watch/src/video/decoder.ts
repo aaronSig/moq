@@ -55,7 +55,17 @@ export interface Stats {
 	bytesReceived: number;
 }
 
+/** A runtime decoder failure for one subscribed rendition. Capability probes cannot predict these. */
+export interface DecoderFailure {
+	track: string;
+	codec: string;
+	phase: "configure" | "decode";
+	message: string;
+}
+
 type DecoderOutput = {
+	/** Last failed rendition; cleared when a different rendition is requested. */
+	error: Signal<DecoderFailure | undefined>;
 	/** Track owning the output frames; distinct from Source.out.track during a handoff. */
 	track: Signal<string | undefined>;
 	/** Requested track still preparing; undefined after promotion or cancellation. */
@@ -83,6 +93,7 @@ export class Decoder {
 	readonly sync: Sync;
 
 	readonly #out: DecoderOutput = {
+		error: new Signal<DecoderFailure | undefined>(undefined),
 		track: new Signal<string | undefined>(undefined),
 		pending: new Signal<string | undefined>(undefined),
 		frame: new Signal<VideoFrame | undefined>(undefined),
@@ -152,6 +163,7 @@ export class Decoder {
 			return;
 		}
 
+		this.#out.error.set(undefined);
 		const current = this.#active.peek();
 		// Returning to the playing track cancels the pending effect above. Reuse
 		// that decoder instead of opening a second subscription to the same track.
@@ -171,6 +183,7 @@ export class Decoder {
 		if (downshift) current.stopDownload();
 
 		let pending: DecoderTrack | undefined = new DecoderTrack({
+			failure: this.#out.error,
 			clockAuthority: current === undefined,
 			priority: current && !downshift ? Catalog.PRIORITY.video - 1 : Catalog.PRIORITY.video,
 			sync: this.sync,
@@ -285,6 +298,7 @@ export class Decoder {
 }
 
 interface DecoderTrackProps {
+	failure: Signal<DecoderFailure | undefined>;
 	clockAuthority: boolean;
 	priority: number;
 	sync: Sync;
@@ -297,6 +311,22 @@ interface DecoderTrackProps {
 }
 
 class DecoderTrack {
+	#failure: Signal<DecoderFailure | undefined>;
+	#failed = false;
+	#fail(error: unknown, phase: DecoderFailure["phase"]): void {
+		if (this.#failed || this.downloadStopped) return;
+		this.#failed = true;
+		// Retire network demand before notifying the application. A frozen decoder
+		// must not keep consuming bandwidth while a fallback is prepared.
+		this.stopDownload();
+		this.#failure.set({
+			track: this.track,
+			codec: this.config.codec,
+			phase,
+			message: error instanceof Error ? error.message : String(error),
+		});
+	}
+
 	clockAuthority: boolean;
 	downloadStopped = false;
 	#subscription?: Moq.Track.Subscriber;
@@ -340,6 +370,7 @@ class DecoderTrack {
 	#signals = new Effect();
 
 	constructor(props: DecoderTrackProps) {
+		this.#failure = props.failure;
 		this.clockAuthority = props.clockAuthority;
 		this.#priority = props.priority;
 		this.sync = props.sync;
@@ -414,9 +445,8 @@ class DecoderTrack {
 					frame.close();
 				}
 			},
-			// TODO bubble up error
 			error: (error) => {
-				console.error(error);
+				this.#fail(error, "decode");
 				effect.close();
 			},
 		});
@@ -425,10 +455,15 @@ class DecoderTrack {
 		});
 
 		// Input processing - depends on container type
-		if (this.config.container.kind === "cmaf") {
-			this.#runCmaf(effect, sub, decoder);
-		} else {
-			this.#runLegacy(effect, sub, decoder);
+		try {
+			if (this.config.container.kind === "cmaf") {
+				this.#runCmaf(effect, sub, decoder);
+			} else {
+				this.#runLegacy(effect, sub, decoder);
+			}
+		} catch (error) {
+			this.#fail(error, "configure");
+			effect.close();
 		}
 	}
 
@@ -499,7 +534,13 @@ class DecoderTrack {
 
 				previous = frame.timestamp;
 
-				decoder.decode(chunk);
+				try {
+					decoder.decode(chunk);
+				} catch (error) {
+					this.#fail(error, "decode");
+					effect.close();
+					break;
+				}
 			}
 		});
 	}
@@ -568,13 +609,19 @@ class DecoderTrack {
 				previous = frame.timestamp;
 
 				if (decoder.state === "closed") break;
-				decoder.decode(
-					new EncodedVideoChunk({
-						type: frame.keyframe ? "key" : "delta",
-						data: frame.payload,
-						timestamp: frame.timestamp,
-					}),
-				);
+				try {
+					decoder.decode(
+						new EncodedVideoChunk({
+							type: frame.keyframe ? "key" : "delta",
+							data: frame.payload,
+							timestamp: frame.timestamp,
+						}),
+					);
+				} catch (error) {
+					this.#fail(error, "decode");
+					effect.close();
+					break;
+				}
 			}
 		});
 	}
@@ -651,6 +698,7 @@ class DecoderTrack {
 	}
 
 	close(): void {
+		this.stopDownload();
 		this.#signals.close();
 
 		this.frame.update((prev) => {
