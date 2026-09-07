@@ -90,7 +90,7 @@ export class Decoder {
 
 	// The current track running, held so we can cancel it when the new track is ready.
 	#active = new Signal<DecoderTrack | undefined>(undefined);
-	readonly #identity: Computed<PlaybackIdentity | undefined>;
+	readonly #selection: Computed<{ track: string; identity: PlaybackIdentity } | undefined>;
 
 	#signals = new Effect();
 
@@ -110,9 +110,13 @@ export class Decoder {
 
 		this.source = source;
 		this.sync = sync;
-		this.#identity = this.#signals.computed((effect) => {
-			const config = effect.get(this.source.out.config);
-			return config ? playbackIdentity(config) : undefined;
+		this.#selection = this.#signals.computed((effect) => {
+			const track = effect.get(this.source.out.track);
+			const available = effect.get(this.source.out.available);
+			const config = track === undefined ? undefined : available[track];
+			// Resolve the name and decoder identity together. Source.config can settle
+			// in a later effect turn after the selected track has already changed.
+			return track !== undefined && config ? { track, identity: playbackIdentity(config) } : undefined;
 		});
 
 		this.#signals.run(this.#runPending.bind(this));
@@ -122,19 +126,14 @@ export class Decoder {
 	}
 
 	#runPending(effect: Effect): void {
-		const values = effect.getAll([
-			this.in.enabled,
-			this.source.in.broadcast,
-			this.source.out.track,
-			this.#identity,
-		]);
+		const values = effect.getAll([this.in.enabled, this.source.in.broadcast, this.#selection]);
 		if (!values) {
 			// Close the active track when disabled (e.g. paused or not visible).
 			// The pending cleanup won't do this because it was already promoted to #active.
 			this.#active.set(undefined);
 			return;
 		}
-		const [_, broadcast, track, identity] = values;
+		const [_, broadcast, { track, identity }] = values;
 
 		// Honor a per-rendition `broadcast` override: subscribe on the resolved source
 		// broadcast instead of the catalog's own broadcast.
