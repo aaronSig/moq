@@ -233,7 +233,11 @@ impl Consumer {
 				// a chunk, sawtoothing A/V sync, and drag it the whole way whenever the
 				// source jumps forward without declaring a hole.
 				Some(r) => {
-					let held = r.held_at().unwrap_or(decoded_at);
+					let held = if r.pending_frames() == 0 {
+						decoded_at
+					} else {
+						r.held_at().unwrap_or(decoded_at)
+					};
 					let skipped = r.skipped();
 					let pcm = r.process(&decoded, decoded_at)?;
 					(pcm, rewind(held, skipped, self.resolved_sample_rate)?)
@@ -796,6 +800,19 @@ mod tests {
 		// It starts with the first packet's samples, so it is stamped where that
 		// packet was. Rewinding from the second one instead puts it a millisecond late.
 		assert_eq!(read[0].0, 0, "held samples moved with the jump: {read:?}");
+	}
+
+	#[tokio::test]
+	async fn a_jump_after_a_full_chunk_uses_the_new_packet_timestamp() {
+		let stamps = [
+			Timestamp::from_micros(0).unwrap(),
+			Timestamp::from_micros(21_000).unwrap(),
+		];
+		let read = pcm_gaps(44_100, 48_000, 882, &stamps).await;
+		let mut r = crate::Resampler::new(44_100, 48_000, 1, 882).unwrap();
+		r.process(&[0.25; 882], stamps[0]).unwrap();
+		let expected = rewind(stamps[1], r.skipped(), 48_000).unwrap().as_micros();
+		assert_eq!(read[1].0, expected);
 	}
 
 	/// Once an end marker arrives the gap check stops running, because from there

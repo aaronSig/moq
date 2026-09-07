@@ -214,16 +214,27 @@ impl Resampler {
 			});
 		}
 
-		// Nothing buffered means the output resumes with these samples, wherever
-		// they came from. Re-anchoring here rather than walking the stamp forward
-		// forever also keeps per-chunk rounding from accumulating.
+		// Nothing buffered means the output resumes with these samples.
 		if self.pending.is_empty() {
 			self.held = Some(at);
 		}
 
 		self.started |= !samples.is_empty();
 		self.pending.extend_from_slice(samples);
-		self.convert()
+		let buffered = self.pending.len();
+		let out = self.convert()?;
+
+		// Earlier calls leave less than one chunk, so consuming any chunk also
+		// consumes all their samples. The remainder belongs to this packet.
+		// Convert its total consumed duration once to preserve fractional progress.
+		if self.pending.len() < buffered {
+			let consumed = (samples.len() - self.pending.len()) / self.channels;
+			let elapsed =
+				moq_net::Timestamp::from_scale(consumed as u64, self.input_rate as u64)?.convert(at.scale())?;
+			self.held = Some(at.checked_add(elapsed)?);
+		}
+
+		Ok(out)
 	}
 
 	/// Convert every whole chunk that is buffered, keeping the remainder.
@@ -253,12 +264,6 @@ impl Resampler {
 			}
 
 			self.pending.drain(..chunk_samples);
-
-			if let Some(held) = self.held {
-				let consumed = moq_net::Timestamp::from_scale(self.chunk_frames as u64, self.input_rate as u64)?
-					.convert(held.scale())?;
-				self.held = Some(held.checked_add(consumed)?);
-			}
 		}
 
 		// Drop the filter's startup silence rather than passing it on as audio. What
@@ -459,8 +464,8 @@ mod tests {
 		assert!(!r.process(&[0.25f32; 441], at(44_100, 44_100)).unwrap().is_empty());
 		assert_eq!(
 			r.held_at(),
-			Some(at(882, 44_100)),
-			"the chunk consumed should be walked off"
+			Some(at(44_541, 44_100)),
+			"the tail starts at the end of the last packet consumed"
 		);
 	}
 
@@ -476,6 +481,23 @@ mod tests {
 
 		r.process(&[0.25f32; 441], at(44_100, 44_100)).unwrap();
 		assert_eq!(r.held_at(), Some(at(44_100, 44_100)));
+	}
+
+	#[test]
+	fn leftover_frames_keep_the_new_packet_timestamp() {
+		let mut r = Resampler::new(44_100, 48_000, 1, 882).unwrap();
+		r.process(&[0.25; 441], at(0, 44_100)).unwrap();
+		r.process(&[0.25; 882], at(44_100, 44_100)).unwrap();
+		assert_eq!(r.pending_frames(), 441);
+		assert_eq!(r.held_at(), Some(at(44_541, 44_100)));
+	}
+
+	#[test]
+	fn held_timestamp_preserves_fractional_chunk_progress() {
+		let mut r = Resampler::new(11_025, 48_000, 1, 220).unwrap();
+		r.process(&vec![0.25; 11_025], at(0, 1000)).unwrap();
+		assert_eq!(r.pending_frames(), 25);
+		assert_eq!(r.held_at(), Some(at(997, 1000)));
 	}
 
 	#[test]
