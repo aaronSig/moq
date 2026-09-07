@@ -506,18 +506,18 @@ struct Namespaces {
 
 #[derive(Default)]
 struct NamespacesState {
-	outgoing: HashMap<PathOwned, RequestId>,
-	incoming: HashMap<PathOwned, RequestId>,
+	outgoing: HashMap<PathOwned, VecDeque<RequestId>>,
+	incoming: HashMap<PathOwned, VecDeque<RequestId>>,
 
 	/// request_id → the namespace that request advertised, one entry per request
-	/// including a duplicate that lost, so [`Namespaces::forget`] releases only the
-	/// name its request owns. The two directions share this map because
+	/// including queued duplicates, so [`Namespaces::forget`] removes only that
+	/// request from its namespace. The two directions share this map because
 	/// moq-transport gives each peer its own request id space.
 	by_request: HashMap<RequestId, (Direction, PathOwned)>,
 }
 
 impl NamespacesState {
-	fn map(&mut self, direction: Direction) -> &mut HashMap<PathOwned, RequestId> {
+	fn map(&mut self, direction: Direction) -> &mut HashMap<PathOwned, VecDeque<RequestId>> {
 		match direction {
 			Direction::Outgoing => &mut self.outgoing,
 			Direction::Incoming => &mut self.incoming,
@@ -535,11 +535,16 @@ impl Namespaces {
 	fn register(&self, direction: Direction, namespace: PathOwned, request_id: RequestId) {
 		let mut state = self.state.lock().unwrap();
 		state.by_request.insert(request_id, (direction, namespace.clone()));
-		state.map(direction).entry(namespace).or_insert(request_id);
+		state.map(direction).entry(namespace).or_default().push_back(request_id);
 	}
 
 	fn get(&self, direction: Direction, namespace: &PathOwned) -> Option<RequestId> {
-		self.state.lock().unwrap().map(direction).get(namespace).copied()
+		self.state
+			.lock()
+			.unwrap()
+			.map(direction)
+			.get(namespace)
+			.and_then(|requests| requests.front().copied())
 	}
 
 	/// Release whatever a finished request holds, so its namespace can be advertised again.
@@ -549,11 +554,14 @@ impl Namespaces {
 			return;
 		};
 
-		// A duplicate that lost carries the same name as the request holding it; releasing
-		// on its behalf would strand the holder, whose withdrawal would resolve to nothing.
+		// Dispatch can accept a queued duplicate after the owner ends, so keep the
+		// oldest surviving registration reachable by namespace-keyed withdrawals.
 		let map = state.map(direction);
-		if map.get(&namespace) == Some(&request_id) {
-			map.remove(&namespace);
+		if let Some(requests) = map.get_mut(&namespace) {
+			requests.retain(|id| *id != request_id);
+			if requests.is_empty() {
+				map.remove(&namespace);
+			}
 		}
 	}
 }
@@ -1535,6 +1543,28 @@ mod tests {
 			cancel(&shared, "cluster/ns", version),
 			Route::CloseStream(RequestId(6))
 		));
+	}
+
+	#[tokio::test]
+	async fn surviving_duplicate_remains_reachable_after_owner_closes() {
+		for version in [Version::Draft14, Version::Draft15] {
+			let shared = Arc::new(Shared::default());
+			let first = receive(&shared, "cluster/ns", version, RequestId(7)).await;
+			let second = receive(&shared, "cluster/ns", version, RequestId(11)).await;
+			let third = receive(&shared, "cluster/ns", version, RequestId(15)).await;
+			drop(first);
+			assert!(matches!(
+				done(&shared, "cluster/ns", version),
+				Route::CloseStream(RequestId(11))
+			));
+			drop(second);
+			assert!(matches!(
+				done(&shared, "cluster/ns", version),
+				Route::CloseStream(RequestId(15))
+			));
+			drop(third);
+			assert!(matches!(done(&shared, "cluster/ns", version), Route::Ignore));
+		}
 	}
 
 	#[test]
