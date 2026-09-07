@@ -65,3 +65,22 @@ test("a finished metadata stream releases its subscription and cannot supply a l
 	consumer.close();
 	track.close();
 });
+
+test("cached metadata catchup yields to rendering work before draining the whole log", async () => {
+	const track = new Track.Producer("large.timeline.z").accept();
+	const producer = new Producer(track, { granularity: 0 });
+	for (let n = 0; n < 512; n++) producer.record(n, Time.Micro(n * 1000000));
+	const consumer = new Consumer(track.subscribe(), producer.section());
+	try {
+		// This models a pending rendering task. A microtask-only drain would consume
+		// the full cached log before the task gets a turn.
+		const atNextTask = await new Promise((resolve) => setTimeout(() => resolve(consumer.lookup(511000, 1000)), 0));
+		expect(atNextTask).toBeUndefined();
+		for (let n = 0; n < 10; n++) await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(consumer.lookup(511000, 1000)?.group).toBe(511);
+	} finally {
+		consumer.close();
+		producer.finish();
+		track.close();
+	}
+});

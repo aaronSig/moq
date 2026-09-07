@@ -86,6 +86,7 @@ export class Consumer {
 		const stream = new Json.Stream.Consumer<Record>(track, { compression: true });
 		void (async () => {
 			try {
+				let batch = 0;
 				for (;;) {
 					const record = await stream.next();
 					if (this.#closed) return;
@@ -94,6 +95,12 @@ export class Consumer {
 						return;
 					}
 					index.push(record);
+					// A long-running publisher's cached metadata can contain thousands of
+					// immediately available records. Let rendering run between bounded batches.
+					if (++batch === 128) {
+						batch = 0;
+						await new Promise((resolve) => setTimeout(resolve, 0));
+					}
 				}
 			} catch {
 				// Timeline hints must never fail otherwise playable media.
