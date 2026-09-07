@@ -177,6 +177,22 @@ pub enum Error {
 	/// Presentation timestamps do not reveal decode duration for reordered video.
 	#[error("duration-less video needs stated durations or presentation-ordered inference")]
 	MissingVideoDuration,
+
+	/// Each fragment restates its decode time, so a stale one lands two different samples on
+	/// the same timestamp. ffmpeg writes one when `frag_every_frame` interleaves audio and
+	/// video; `-frag_duration` cuts just as finely and stamps the fragments correctly.
+	#[error(
+		"track {track}: fragment decode time {decode_time:?} does not advance past {previous:?}; \
+		 ffmpeg repeats a tfdt when frag_every_frame interleaves audio and video, use -frag_duration instead"
+	)]
+	NonMonotonicDecodeTime {
+		/// The track containing the rejected fragment.
+		track: u32,
+		/// The rejected fragment's decode time in the track's timescale.
+		decode_time: moq_net::Timestamp,
+		/// The preceding fragment's decode time in the track's timescale.
+		previous: moq_net::Timestamp,
+	},
 }
 
 impl From<mp4_atom::Error> for Error {
