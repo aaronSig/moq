@@ -2061,11 +2061,15 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 							// straggler below the first group, so pin the floor to what
 							// was announced.
 							track.start_at(group.sequence);
-							writer
-								.encode(&lite::SubscribeResponse::Start(lite::SubscribeStart {
-									group: group.sequence,
-								}))
-								.await?;
+							Self::write_control_response(
+								&lite::SubscribeResponse::Start(lite::SubscribeStart { group: group.sequence }),
+								&mut track,
+								reader,
+								writer,
+								&mut tasks,
+								track_priority_tx,
+							)
+							.await?;
 						}
 						self.queue_serve(group, &mut tasks);
 					}
@@ -2075,16 +2079,21 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 						// even if trailing groups (below `group`) are still in flight, then
 						// keep serving them until the live edge reaches the boundary.
 						end_sent = true;
-						writer
-							.encode(&lite::SubscribeResponse::End(lite::SubscribeEnd { group }))
-							.await?;
+						Self::write_control_response(
+							&lite::SubscribeResponse::End(lite::SubscribeEnd { group }),
+							&mut track,
+							reader,
+							writer,
+							&mut tasks,
+							track_priority_tx,
+						)
+						.await?;
 					}
 					Recv::Finished => {
 						// The live edge reached the boundary; SUBSCRIBE_END was already sent
 						// (or the version predates the track stream). Drain in-flight group
 						// tasks and FIN by returning.
-						while tasks.next().await.is_some() {}
-						return Ok(());
+						return Self::drain_groups(&mut track, reader, &mut tasks, track_priority_tx).await;
 					}
 				},
 				Event::Update(upd) => {
@@ -2094,24 +2103,103 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 						// groups get cancelled rather than completed pointlessly.
 						return Ok(());
 					};
-					if let Ok(mut value) = track_priority_tx.write() {
-						*value = upd.priority;
-					}
-					// Feed the full update into the model subscriber so the producer's
-					// aggregate reflects it (and a relay re-forwards it upstream).
-					let _ = track.update(crate::track::Subscription {
-						priority: upd.priority,
-						ordered: upd.ordered,
-						latency_max: upd.max_latency,
-						group_start: upd.start_group,
-						group_end: upd.end_group,
-						..Default::default()
-					});
-					if let Some(start_group) = upd.start_group {
-						track.start_at(start_group);
-					}
-					track.end_at(upd.end_group);
+					Self::apply_subscribe_update(&mut track, track_priority_tx, upd);
 				}
+			}
+		}
+	}
+
+	fn apply_subscribe_update(
+		track: &mut track::Subscriber,
+		priority_tx: &kio::Producer<u8>,
+		upd: lite::SubscribeUpdate,
+	) {
+		if let Ok(mut value) = priority_tx.write() {
+			*value = upd.priority;
+		}
+		let _ = track.update(crate::track::Subscription {
+			priority: upd.priority,
+			ordered: upd.ordered,
+			latency_max: upd.max_latency,
+			group_start: upd.start_group,
+			group_end: upd.end_group,
+			..Default::default()
+		});
+		if let Some(start) = upd.start_group {
+			track.start_at(start);
+		}
+		track.end_at(upd.end_group);
+	}
+
+	/// A full send window must not prevent the peer cancelling or reprioritizing
+	/// its subscription. Pin exactly one encode future: restarting it after an
+	/// update would duplicate a partially written boundary message.
+	async fn write_control_response(
+		response: &lite::SubscribeResponse,
+		track: &mut track::Subscriber,
+		reader: &mut crate::coding::Reader<S::RecvStream, Version>,
+		writer: &mut Writer<S::SendStream, Version>,
+		tasks: &mut FuturesUnordered<MaybeSendBox<'static, ()>>,
+		priority_tx: &kio::Producer<u8>,
+	) -> Result<(), Error> {
+		enum Event {
+			Update(Result<Option<lite::SubscribeUpdate>, Error>),
+			Written(Result<(), Error>),
+		}
+		let mut write = std::pin::pin!(writer.encode(response));
+		loop {
+			let event = {
+				let mut update = std::pin::pin!(reader.decode_maybe::<lite::SubscribeUpdate>());
+				kio::wait(|waiter| {
+					if let Poll::Ready(upd) = waiter.poll_future(update.as_mut()) {
+						return Poll::Ready(Event::Update(upd));
+					}
+					let mut cx = std::task::Context::from_waker(waiter.waker());
+					while let Poll::Ready(Some(())) = tasks.poll_next_unpin(&mut cx) {}
+					waiter.poll_future(write.as_mut()).map(Event::Written)
+				})
+				.await
+			};
+			match event {
+				Event::Update(Ok(Some(upd))) => Self::apply_subscribe_update(track, priority_tx, upd),
+				// The response may be partial. Abort the outer writer instead of
+				// FINishing a truncated control message; dropping group tasks resets media.
+				Event::Update(Ok(None)) => return Err(Error::Cancel),
+				Event::Update(Err(err)) => return Err(err),
+				Event::Written(result) => return result,
+			}
+		}
+	}
+
+	/// Source completion still owes its groups, but a peer FIN cancels that debt.
+	/// Keep updates live while waiting for the remaining media acknowledgements.
+	async fn drain_groups(
+		track: &mut track::Subscriber,
+		reader: &mut crate::coding::Reader<S::RecvStream, Version>,
+		tasks: &mut FuturesUnordered<MaybeSendBox<'static, ()>>,
+		priority_tx: &kio::Producer<u8>,
+	) -> Result<(), Error> {
+		loop {
+			let event = {
+				let mut update = std::pin::pin!(reader.decode_maybe::<lite::SubscribeUpdate>());
+				kio::wait(|waiter| {
+					if let Poll::Ready(upd) = waiter.poll_future(update.as_mut()) {
+						return Poll::Ready(Some(upd));
+					}
+					let mut cx = std::task::Context::from_waker(waiter.waker());
+					while let Poll::Ready(Some(())) = tasks.poll_next_unpin(&mut cx) {}
+					if tasks.is_empty() {
+						Poll::Ready(None)
+					} else {
+						Poll::Pending
+					}
+				})
+				.await
+			};
+			match event {
+				Some(Ok(Some(upd))) => Self::apply_subscribe_update(track, priority_tx, upd),
+				Some(Err(err)) => return Err(err),
+				Some(Ok(None)) | None => return Ok(()),
 			}
 		}
 	}
@@ -3140,5 +3228,360 @@ mod tests {
 		);
 		assert_eq!(probes[0].bitrate, Some(1_000_000));
 		assert_eq!(probes[1].bitrate, None);
+	}
+}
+
+#[cfg(all(test, not(loom)))]
+mod control_liveness_tests {
+	use super::*;
+	use crate::coding::Reader;
+	use crate::lite::test_transport::*;
+	use web_transport_trait::Session as _;
+
+	#[derive(Clone, Default)]
+	struct Input {
+		bytes: Vec<u8>,
+		fin: bool,
+	}
+
+	struct ControlledRecv {
+		input: kio::Consumer<Input>,
+		offset: usize,
+	}
+	impl web_transport_trait::RecvStream for ControlledRecv {
+		type Error = SinkError;
+		async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, SinkError> {
+			let offset = self.offset;
+			let bytes = self
+				.input
+				.wait(|input| {
+					if offset < input.bytes.len() {
+						Poll::Ready(Some(input.bytes[offset..].to_vec()))
+					} else if input.fin {
+						Poll::Ready(None)
+					} else {
+						Poll::Pending
+					}
+				})
+				.await
+				.map_err(|_| SinkError)?;
+			let Some(bytes) = bytes else {
+				return Ok(None);
+			};
+			let count = dst.len().min(bytes.len());
+			dst[..count].copy_from_slice(&bytes[..count]);
+			self.offset += count;
+			Ok(Some(count))
+		}
+		fn stop(&mut self, _: u32) {}
+		async fn closed(&mut self) -> Result<(), SinkError> {
+			std::future::pending().await
+		}
+	}
+
+	struct ControlledSend {
+		inner: SinkSend,
+		budget: Option<kio::Consumer<usize>>,
+		written: usize,
+	}
+	impl web_transport_trait::SendStream for ControlledSend {
+		type Error = SinkError;
+		async fn write(&mut self, buf: &[u8]) -> Result<usize, SinkError> {
+			let limit = if let Some(budget) = &self.budget {
+				let written = self.written;
+				budget
+					.wait(|n| {
+						if **n > written {
+							Poll::Ready(**n - written)
+						} else {
+							Poll::Pending
+						}
+					})
+					.await
+					.map_err(|_| SinkError)?
+			} else {
+				usize::MAX
+			};
+			let count = web_transport_trait::SendStream::write(&mut self.inner, &buf[..buf.len().min(limit)]).await?;
+			self.written += count;
+			Ok(count)
+		}
+		fn set_priority(&mut self, p: u8) {
+			web_transport_trait::SendStream::set_priority(&mut self.inner, p);
+		}
+		fn finish(&mut self) -> Result<(), SinkError> {
+			web_transport_trait::SendStream::finish(&mut self.inner)
+		}
+		fn reset(&mut self, p: u32) {
+			web_transport_trait::SendStream::reset(&mut self.inner, p);
+		}
+		async fn closed(&mut self) -> Result<(), SinkError> {
+			web_transport_trait::SendStream::closed(&mut self.inner).await
+		}
+	}
+
+	#[derive(Clone)]
+	struct ControlledSession {
+		control: SinkSession,
+		media: SinkSession,
+		input: kio::Consumer<Input>,
+		budget: Option<kio::Consumer<usize>>,
+	}
+	impl web_transport_trait::Session for ControlledSession {
+		type SendStream = ControlledSend;
+		type RecvStream = ControlledRecv;
+		type Error = SinkError;
+		async fn open_bi(&self) -> Result<(ControlledSend, ControlledRecv), SinkError> {
+			let (send, _) = self.control.open_bi().await?;
+			Ok((
+				ControlledSend {
+					inner: send,
+					budget: self.budget.clone(),
+					written: 0,
+				},
+				ControlledRecv {
+					input: self.input.clone(),
+					offset: 0,
+				},
+			))
+		}
+		async fn open_uni(&self) -> Result<ControlledSend, SinkError> {
+			Ok(ControlledSend {
+				inner: self.media.open_uni().await?,
+				budget: None,
+				written: 0,
+			})
+		}
+		async fn accept_bi(&self) -> Result<(ControlledSend, ControlledRecv), SinkError> {
+			std::future::pending().await
+		}
+		async fn accept_uni(&self) -> Result<ControlledRecv, SinkError> {
+			std::future::pending().await
+		}
+		fn send_datagram(&self, _: bytes::Bytes) -> Result<(), SinkError> {
+			Ok(())
+		}
+		async fn recv_datagram(&self) -> Result<bytes::Bytes, SinkError> {
+			std::future::pending().await
+		}
+		fn max_datagram_size(&self) -> usize {
+			0
+		}
+		fn protocol(&self) -> Option<&str> {
+			None
+		}
+		fn close(&self, _: u32, _: &str) {}
+		async fn closed(&self) -> SinkError {
+			std::future::pending().await
+		}
+		fn stats(&self) -> impl web_transport_trait::Stats {
+			SinkStats::default()
+		}
+	}
+
+	async fn cancellation_case(mode: &str) {
+		let control_gate = kio::Producer::new(mode != "start");
+		let media_gate = kio::Producer::new(false);
+		let input = kio::Producer::new(Input::default());
+		let session = ControlledSession {
+			control: SinkSession::gated_bi(control_gate.consume()),
+			media: SinkSession::gated_uni(media_gate.consume()),
+			input: input.consume(),
+			budget: None,
+		};
+		let control_log = session.control.log.clone();
+		let media_log = session.media.log.clone();
+		let (send, recv) = session.open_bi().await.unwrap();
+		let mut writer = Writer::new(send, Version::Lite05);
+		let mut reader = Reader::new(recv, Version::Lite05);
+		let priority = kio::Producer::new(50u8);
+		let subscription = Subscription {
+			session,
+			id: 1,
+			track_name: "trial".into(),
+			priority: PriorityQueue::default(),
+			track_priority: priority.consume(),
+			track_priority_seen: 50,
+			version: Version::Lite05,
+			timescale: Some(crate::Timescale::default()),
+		};
+		let mut producer = track::Producer::new(Arc::new(crate::broadcast::Info::default()), "trial", None);
+		let mut group = producer.create_group(group::Info { sequence: 0 }).unwrap();
+		group
+			.write_frame(
+				crate::Timestamp::from_millis(0).unwrap(),
+				b"queued trial frame".as_slice(),
+			)
+			.unwrap();
+		group.finish().unwrap();
+		let subscriber = producer.subscribe(crate::track::Subscription::default());
+		let mut run = Box::pin(subscription.run_track(subscriber, None, None, &mut reader, &mut writer, &priority));
+		assert!(futures::poll!(run.as_mut()).is_pending());
+		if mode == "start" {
+			assert!(control_log.writes.lock().unwrap().is_empty(), "START must be blocked");
+		} else {
+			assert!(
+				!control_log.writes.lock().unwrap().is_empty(),
+				"START must have been written"
+			);
+		}
+		if mode == "end" || mode == "drain" {
+			if mode == "end" {
+				*control_gate.write().ok().unwrap() = false;
+			}
+			producer.finish_at(1).unwrap();
+			assert!(futures::poll!(run.as_mut()).is_pending());
+		}
+		input.write().ok().unwrap().fin = true;
+		let outcome = futures::poll!(run.as_mut());
+		assert!(
+			matches!(outcome, Poll::Ready(Ok(())) | Poll::Ready(Err(Error::Cancel))),
+			"peer cancellation was blocked in {mode} despite no need to deliver further media"
+		);
+		drop(run);
+		assert!(
+			media_log.writes.lock().unwrap().is_empty(),
+			"cancel must not open the data gate"
+		);
+		if mode != "start" {
+			assert_eq!(media_log.resets(), vec![Error::Cancel.to_code()]);
+		}
+	}
+
+	#[tokio::test]
+	async fn cancel_while_start_boundary_write_is_blocked() {
+		cancellation_case("start").await
+	}
+	#[tokio::test]
+	async fn cancel_while_end_boundary_write_is_blocked() {
+		cancellation_case("end").await
+	}
+	#[tokio::test]
+	async fn cancel_while_finished_track_drains_blocked_groups() {
+		cancellation_case("drain").await
+	}
+	#[tokio::test]
+	async fn cancel_while_ordinary_live_group_write_is_blocked() {
+		cancellation_case("ordinary").await
+	}
+
+	#[tokio::test]
+	async fn fragmented_update_does_not_duplicate_partial_boundary() {
+		let gate = kio::Producer::new(true);
+		let budget = kio::Producer::new(1usize);
+		let input = kio::Producer::new(Input::default());
+		let session = ControlledSession {
+			control: SinkSession::gated_bi(gate.consume()),
+			media: SinkSession::default(),
+			input: input.consume(),
+			budget: Some(budget.consume()),
+		};
+		let log = session.control.log.clone();
+		let (send, recv) = session.open_bi().await.unwrap();
+		let mut writer = Writer::new(send, Version::Lite05);
+		let mut reader = Reader::new(recv, Version::Lite05);
+		let priority = kio::Producer::new(50u8);
+		let producer = track::Producer::new(Arc::new(crate::broadcast::Info::default()), "trial", None);
+		let mut track = producer.subscribe(crate::track::Subscription::default());
+		let mut tasks = FuturesUnordered::new();
+		let response = lite::SubscribeResponse::Start(lite::SubscribeStart { group: 123456 });
+		let mut expected = bytes::BytesMut::new();
+		response.encode(&mut expected, Version::Lite05).unwrap();
+		assert!(expected.len() > 1);
+		let mut work = Box::pin(Subscription::<ControlledSession>::write_control_response(
+			&response,
+			&mut track,
+			&mut reader,
+			&mut writer,
+			&mut tasks,
+			&priority,
+		));
+		assert!(futures::poll!(work.as_mut()).is_pending());
+		assert_eq!(log.writes.lock().unwrap().len(), 1);
+		let update = lite::SubscribeUpdate {
+			priority: 80,
+			ordered: true,
+			max_latency: Duration::from_millis(700),
+			start_group: Some(123456),
+			end_group: Some(123460),
+		};
+		let mut bytes = bytes::BytesMut::new();
+		update.encode(&mut bytes, Version::Lite05).unwrap();
+		input.write().ok().unwrap().bytes.push(bytes[0]);
+		assert!(futures::poll!(work.as_mut()).is_pending());
+		assert_eq!(*priority.read(), 50, "partial update must not apply");
+		input.write().ok().unwrap().bytes.extend_from_slice(&bytes[1..]);
+		assert!(futures::poll!(work.as_mut()).is_pending());
+		assert_eq!(*priority.read(), 80, "priority must apply before output unblocks");
+		*budget.write().ok().unwrap() = usize::MAX;
+		assert!(matches!(futures::poll!(work.as_mut()), Poll::Ready(Ok(()))));
+		drop(work);
+		assert_eq!(
+			*log.writes.lock().unwrap(),
+			expected.as_ref(),
+			"partial boundary must not restart"
+		);
+		assert_eq!(track.subscription().priority, 80);
+		assert_eq!(track.subscription().group_start, Some(123456));
+		assert_eq!(track.subscription().group_end, Some(123460));
+		assert!(track.subscription().ordered);
+		assert_eq!(track.subscription().latency_max, Duration::from_millis(700));
+	}
+
+	#[tokio::test]
+	async fn successful_completion_waits_for_all_queued_media() {
+		let control_gate = kio::Producer::new(true);
+		let media_gate = kio::Producer::new(false);
+		let input = kio::Producer::new(Input::default());
+		let session = ControlledSession {
+			control: SinkSession::gated_bi(control_gate.consume()),
+			media: SinkSession::gated_uni(media_gate.consume()),
+			input: input.consume(),
+			budget: None,
+		};
+		let log = session.media.log.clone();
+		let (send, recv) = session.open_bi().await.unwrap();
+		let mut writer = Writer::new(send, Version::Lite05);
+		let mut reader = Reader::new(recv, Version::Lite05);
+		let priority = kio::Producer::new(50u8);
+		let subscription = Subscription {
+			session,
+			id: 1,
+			track_name: "trial".into(),
+			priority: PriorityQueue::default(),
+			track_priority: priority.consume(),
+			track_priority_seen: 50,
+			version: Version::Lite05,
+			timescale: Some(crate::Timescale::default()),
+		};
+		let mut producer = track::Producer::new(Arc::new(crate::broadcast::Info::default()), "trial", None);
+		let mut group = producer.create_group(group::Info { sequence: 0 }).unwrap();
+		group
+			.write_frame(
+				crate::Timestamp::from_millis(0).unwrap(),
+				b"complete movie frame".as_slice(),
+			)
+			.unwrap();
+		group.finish().unwrap();
+		producer.finish_at(1).unwrap();
+		let subscriber = producer.subscribe(crate::track::Subscription::default());
+		let mut run = Box::pin(subscription.run_track(subscriber, None, None, &mut reader, &mut writer, &priority));
+		assert!(futures::poll!(run.as_mut()).is_pending());
+		assert!(log.writes.lock().unwrap().is_empty());
+		assert!(log.resets().is_empty());
+		*media_gate.write().ok().unwrap() = true;
+		assert!(matches!(futures::poll!(run.as_mut()), Poll::Ready(Ok(()))));
+		drop(run);
+		assert!(
+			log.writes
+				.lock()
+				.unwrap()
+				.windows(b"complete movie frame".len())
+				.any(|w| w == b"complete movie frame")
+		);
+		assert!(
+			log.resets().is_empty(),
+			"clean completion must not reset delivered groups"
+		);
 	}
 }
