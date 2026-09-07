@@ -88,7 +88,11 @@ export class Consumer {
 			try {
 				for (;;) {
 					const record = await stream.next();
-					if (this.#closed || !record) return;
+					if (this.#closed) return;
+					if (record === undefined) {
+						this.close();
+						return;
+					}
 					index.push(record);
 				}
 			} catch {

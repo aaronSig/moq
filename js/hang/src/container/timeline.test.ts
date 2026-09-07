@@ -51,3 +51,17 @@ test("compressed live timeline is usable while owned and closes when cancelled",
 	producer.finish();
 	track.close();
 });
+
+test("a finished metadata stream releases its subscription and cannot supply a live handoff", async () => {
+	const track = new Track.Producer("ended.timeline.z").accept();
+	const producer = new Producer(track);
+	const sub = track.subscribe();
+	const consumer = new Consumer(sub, producer.section());
+	producer.record(10, Time.Micro(1000000));
+	producer.finish();
+	for (let n = 0; n < 8; n++) await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(consumer.lookup(1100, 700)).toBeUndefined();
+	expect(sub.closed.peek()).toBeDefined();
+	consumer.close();
+	track.close();
+});
