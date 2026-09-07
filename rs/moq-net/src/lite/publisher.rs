@@ -2405,6 +2405,84 @@ mod serve_group_test {
 	use crate::lite::test_transport::*;
 	use crate::{Timestamp, broadcast};
 
+	/// A blocked payload must yield its old rank before send capacity returns.
+	/// Otherwise a newly urgent track ties the stale rank at the transport.
+	#[tokio::test]
+	async fn blocked_payload_reprices_when_an_urgent_group_arrives() {
+		use web_transport_trait::Session;
+		let gate = kio::Producer::new(false);
+		let session = SinkSession::gated_uni(gate.consume());
+		let log = session.log.clone();
+		let mut writer = Writer::new(session.open_uni().await.unwrap(), Version::Lite06Wip);
+		let track_priority = kio::Producer::new(50u8);
+		let queue = PriorityQueue::default();
+		let mut handle = queue.insert(Priority::new(50, 1));
+		let mut subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: queue.clone(),
+			track_priority: track_priority.consume(),
+			track_priority_seen: 50,
+			version: Version::Lite06Wip,
+			timescale: None,
+		};
+		let payload = bytes::Bytes::from_static(b"payload must survive reprioritization");
+		let mut send = std::pin::pin!(subscription.write_chunk(&mut writer, &mut handle, payload.clone()));
+		assert!(futures::poll!(send.as_mut()).is_pending());
+		assert_eq!(log.priorities().last(), Some(&255));
+		let urgent = queue.insert(Priority::new(80, 0));
+		assert!(futures::poll!(send.as_mut()).is_pending());
+		assert_eq!(
+			log.priorities().last(),
+			Some(&254),
+			"blocked old write kept the urgent transport rank"
+		);
+		drop(urgent);
+		assert!(futures::poll!(send.as_mut()).is_pending());
+		assert_eq!(log.priorities().last(), Some(&255));
+		*gate.write().ok().unwrap() = true;
+		send.await.unwrap();
+		assert_eq!(*log.writes.lock().unwrap(), payload.as_ref());
+	}
+
+	#[tokio::test]
+	async fn blocked_payload_reprices_after_subscribe_update() {
+		use web_transport_trait::Session;
+		let gate = kio::Producer::new(false);
+		let session = SinkSession::gated_uni(gate.consume());
+		let log = session.log.clone();
+		let mut writer = Writer::new(session.open_uni().await.unwrap(), Version::Lite06Wip);
+		let track_priority = kio::Producer::new(50u8);
+		let queue = PriorityQueue::default();
+		let _other = queue.insert(Priority::new(60, 1));
+		let mut handle = queue.insert(Priority::new(50, 1));
+		let mut subscription = Subscription {
+			session,
+			id: 0,
+			track_name: "test".into(),
+			priority: queue,
+			track_priority: track_priority.consume(),
+			track_priority_seen: 50,
+			version: Version::Lite06Wip,
+			timescale: None,
+		};
+		let mut send =
+			std::pin::pin!(subscription.write_chunk(&mut writer, &mut handle, bytes::Bytes::from_static(b"hello")));
+		assert!(futures::poll!(send.as_mut()).is_pending());
+		assert_eq!(log.priorities().last(), Some(&254));
+		*track_priority.write().ok().unwrap() = 70;
+		assert!(futures::poll!(send.as_mut()).is_pending());
+		assert_eq!(
+			log.priorities().last(),
+			Some(&255),
+			"blocked write ignored SUBSCRIBE_UPDATE"
+		);
+		*gate.write().ok().unwrap() = true;
+		send.await.unwrap();
+		assert_eq!(*log.writes.lock().unwrap(), b"hello");
+	}
+
 	#[tokio::test]
 	async fn resets_with_the_abort_code() {
 		let log = Log::default();
