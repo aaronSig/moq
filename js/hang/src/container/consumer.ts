@@ -109,6 +109,16 @@ function continues(prev: Group, next: Group | undefined): next is Group {
 	);
 }
 
+/** Completed MoQ object reads, before container parsing or media reordering. */
+export interface ReceiveProgress {
+	/** Complete objects, including container metadata and endpoint markers. */
+	objectsReceived: number;
+	/** Complete object payload bytes, including container headers but excluding transport overhead. */
+	bytesReceived: number;
+	/** Browser monotonic time of the last completed read; not packet arrival or decoder input time. */
+	lastReceivedAtMs?: number;
+}
+
 /** Reads frames from a MoQ track in order, buffering groups and skipping slow ones to meet the latency target. */
 export class Consumer {
 	#track: Moq.Track.Subscriber;
@@ -137,6 +147,10 @@ export class Consumer {
 	#buffered = new Signal<BufferedRanges>([]);
 	/** The time ranges currently buffered and ready to play. */
 	readonly buffered: Getter<BufferedRanges> = this.#buffered;
+
+	#received = new Signal<ReceiveProgress>({ objectsReceived: 0, bytesReceived: 0 });
+	/** Receive progress independent of next(), decoding and presentation. */
+	readonly received: Getter<ReceiveProgress> = this.#received;
 
 	#signals = new Effect();
 
@@ -210,6 +224,11 @@ export class Consumer {
 			for (;;) {
 				const next = await group.consumer.readFrame();
 				if (!next) break;
+				this.#received.update((previous) => ({
+					objectsReceived: previous.objectsReceived + 1,
+					bytesReceived: previous.bytesReceived + next.payload.byteLength,
+					lastReceivedAtMs: performance.now(),
+				}));
 				group.empty = false;
 
 				const decoded = this.#format.decode(next.payload);

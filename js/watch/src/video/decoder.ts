@@ -63,7 +63,17 @@ export interface DecoderFailure {
 	message: string;
 }
 
+/** Receive progress for one video subscription, including trials that have not decoded yet. */
+export interface TrackReceive extends Container.ReceiveProgress {
+	/** Rendition name in the current broadcast. */
+	track: string;
+	/** Monotonic identity within this Decoder; changes when the same rendition is reopened. */
+	subscriptionId: number;
+}
+
 type DecoderOutput = {
+	/** Complete object reads for the active and pending subscriptions; absent after retirement. */
+	receive: Signal<{ active?: TrackReceive; pending?: TrackReceive }>;
 	/** Last failed rendition; cleared when a different rendition is requested. */
 	error: Signal<DecoderFailure | undefined>;
 	/** Track owning the output frames; distinct from Source.out.track during a handoff. */
@@ -93,6 +103,7 @@ export class Decoder {
 	readonly sync: Sync;
 
 	readonly #out: DecoderOutput = {
+		receive: new Signal<{ active?: TrackReceive; pending?: TrackReceive }>({}),
 		error: new Signal<DecoderFailure | undefined>(undefined),
 		track: new Signal<string | undefined>(undefined),
 		pending: new Signal<string | undefined>(undefined),
@@ -107,6 +118,8 @@ export class Decoder {
 
 	// The current track running, held so we can cancel it when the new track is ready.
 	#active = new Signal<DecoderTrack | undefined>(undefined);
+	#pending = new Signal<DecoderTrack | undefined>(undefined);
+	#subscriptionSequence = 0;
 	readonly #selection: Computed<{ track: string; identity: PlaybackIdentity } | undefined>;
 
 	#signals = new Effect();
@@ -139,6 +152,7 @@ export class Decoder {
 		this.#signals.run(this.#runPending.bind(this));
 		this.#signals.run(this.#runActive.bind(this));
 		this.#signals.run(this.#runDisplay.bind(this));
+		this.#signals.run(this.#runReceive.bind(this));
 		this.#signals.run(this.#runBuffering.bind(this));
 	}
 
@@ -183,6 +197,7 @@ export class Decoder {
 		if (downshift) current.stopDownload();
 
 		let pending: DecoderTrack | undefined = new DecoderTrack({
+			subscriptionId: ++this.#subscriptionSequence,
 			failure: this.#out.error,
 			clockAuthority: current === undefined,
 			priority: current && !downshift ? Catalog.PRIORITY.video - 1 : Catalog.PRIORITY.video,
@@ -194,9 +209,11 @@ export class Decoder {
 			stats: this.#out.stats,
 		});
 
+		this.#pending.set(pending);
 		this.#out.pending.set(track);
 		effect.cleanup(() => {
 			pending?.close();
+			this.#pending.set(undefined);
 			this.#out.pending.set(undefined);
 		});
 
@@ -219,6 +236,7 @@ export class Decoder {
 			pending.clockAuthority = true;
 			pending.setPriority(Catalog.PRIORITY.video);
 			this.#out.pending.set(undefined);
+			this.#pending.set(undefined);
 			this.#active.set(pending);
 			pending = undefined;
 
@@ -249,6 +267,15 @@ export class Decoder {
 		});
 		effect.proxy(this.#out.timestamp, active.timestamp);
 		effect.proxy(this.#out.buffered, active.buffered);
+	}
+
+	#runReceive(effect: Effect): void {
+		const read = (track: DecoderTrack | undefined): TrackReceive | undefined => {
+			if (!track) return;
+			const progress = effect.get(track.received);
+			return progress && { ...progress, track: track.track, subscriptionId: track.subscriptionId };
+		};
+		this.#out.receive.set({ active: read(effect.get(this.#active)), pending: read(effect.get(this.#pending)) });
 	}
 
 	#runDisplay(effect: Effect): void {
@@ -298,6 +325,7 @@ export class Decoder {
 }
 
 interface DecoderTrackProps {
+	subscriptionId: number;
 	failure: Signal<DecoderFailure | undefined>;
 	clockAuthority: boolean;
 	priority: number;
@@ -311,6 +339,8 @@ interface DecoderTrackProps {
 }
 
 class DecoderTrack {
+	readonly subscriptionId: number;
+	readonly received = new Signal<Container.ReceiveProgress | undefined>(undefined);
 	#failure: Signal<DecoderFailure | undefined>;
 	#failed = false;
 	#fail(error: unknown, phase: DecoderFailure["phase"]): void {
@@ -370,6 +400,7 @@ class DecoderTrack {
 	#signals = new Effect();
 
 	constructor(props: DecoderTrackProps) {
+		this.subscriptionId = props.subscriptionId;
 		this.#failure = props.failure;
 		this.clockAuthority = props.clockAuthority;
 		this.#priority = props.priority;
@@ -476,6 +507,7 @@ class DecoderTrack {
 			latency: this.#latency,
 		});
 		effect.cleanup(() => consumer.close());
+		effect.proxy(this.received, consumer.received);
 
 		// Combine network jitter buffer with decode buffer
 		effect.run((inner) => {
@@ -558,6 +590,7 @@ class DecoderTrack {
 			latency: this.#latency,
 		});
 		effect.cleanup(() => consumer.close());
+		effect.proxy(this.received, consumer.received);
 
 		// Combine network jitter buffer with decode buffer
 		effect.run((inner) => {

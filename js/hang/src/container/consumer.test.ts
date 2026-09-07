@@ -1210,3 +1210,25 @@ test("Consumer reports continuity across a PTS-contiguous group id jump (CMAF)",
 
 	consumer.close();
 });
+
+test("receive progress advances before reordered frames are requested", async () => {
+	const producer = new Track.Producer("receive-progress").accept();
+	const consumer = new Consumer(producer.subscribe(), { format: new LegacyFormat(), latency: Time.Milli(700) });
+	try {
+		expect(consumer.received.peek()).toEqual({ objectsReceived: 0, bytesReceived: 0 });
+		const payload = encodeLegacyFrame(Time.Micro(1000), new Uint8Array([1, 2, 3]));
+		const group = producer.appendGroup();
+		group.writeFrame({ payload, timestamp: Time.Timestamp.fromMicros(Time.Micro(1000)) });
+		group.close();
+		await settle();
+		// No next() call: the object is still waiting in the reorder buffer.
+		expect(consumer.received.peek().objectsReceived).toBe(1);
+		expect(consumer.received.peek().bytesReceived).toBe(payload.byteLength);
+		expect(consumer.received.peek().lastReceivedAtMs).toBeGreaterThan(0);
+		await consumer.next();
+		expect(consumer.received.peek().objectsReceived).toBe(1);
+	} finally {
+		consumer.close();
+		producer.close();
+	}
+});
