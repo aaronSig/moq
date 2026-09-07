@@ -88,8 +88,8 @@ impl Resampler {
 	/// Output frames dropped so far as the filter's startup silence.
 	///
 	/// The output runs that much shorter than the input it was built from, so a
-	/// caller stamping its output has to reach back this far from
-	/// [`held_at`](Self::held_at).
+	/// caller stamping its output has to reach back this far from the buffered
+	/// input's source timestamp.
 	pub fn skipped(&self) -> usize {
 		self.delay - self.skip
 	}
@@ -111,7 +111,7 @@ impl Resampler {
 	/// [`drain`](Self::drain) or [`flush`](Self::flush) tail begins.
 	///
 	/// `None` until the first input, where the caller's own stamp is the answer.
-	pub fn held_at(&self) -> Option<moq_net::Timestamp> {
+	pub(crate) fn held_at(&self) -> Option<moq_net::Timestamp> {
 		self.held
 	}
 
@@ -201,8 +201,8 @@ impl Resampler {
 
 	/// Resample interleaved `f32` input into interleaved `f32` output.
 	///
-	/// `at` is where the first of `samples` was presented, which is what lets
-	/// [`held_at`](Self::held_at) say where the output actually begins.
+	/// `at` is where the first of `samples` was presented, so buffered input keeps
+	/// its source timestamp across calls.
 	///
 	/// Returns whatever the resampler can produce given the input and
 	/// the chunk size; remaining samples are buffered for the next call.
