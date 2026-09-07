@@ -176,6 +176,8 @@ show a playback error. The player does not silently change codec policy.
 Each reports a track, subscription identity, completed object count, byte count
 and last completion time on the browser monotonic clock. This advances before
 media reordering, decoding or rendering, including while an upgrade is waiting.
+The first read time and first/last delivered group IDs distinguish a history
+request from the group the relay actually delivered.
 Bytes include container headers, exclude transport overhead and retransmissions,
 and must not be treated as spare capacity. These are completed JavaScript reads,
 not packet arrival timestamps. A cancelled subscription disappears; reopening
