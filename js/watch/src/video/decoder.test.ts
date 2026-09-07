@@ -94,6 +94,8 @@ function fixture() {
 		out: { track: selected, config, available, catalog: new Signal({ renditions: { low, high } }) },
 	} as unknown as Source;
 	const received: number[] = [];
+	const paced = new Signal(false);
+	const waits: (() => void)[] = [];
 	let resets = 0;
 	const sync = {
 		out: { buffer: new Signal(Time.Milli.zero), reference: new Signal(0) },
@@ -101,9 +103,9 @@ function fixture() {
 		reset: () => {
 			resets++;
 		},
-		wait: async () => {},
+		wait: () => new Promise<void>((resolve) => waits.push(resolve)),
 	} as unknown as Sync;
-	const decoder = new Decoder(source, sync, { enabled: true, paced: false });
+	const decoder = new Decoder(source, sync, { enabled: true, paced });
 	function send(name: keyof typeof producers, pts: number) {
 		const group = producers[name].appendGroup();
 		group.writeFrame({
@@ -119,6 +121,10 @@ function fixture() {
 		available,
 		opened,
 		received,
+		paced,
+		release: () => {
+			for (const resolve of waits.splice(0)) resolve();
+		},
 		get resets() {
 			return resets;
 		},
@@ -140,6 +146,123 @@ test("a new track uses its own decoder config before the separate config signal 
 		await settle();
 		expect(f.opened.map((x) => x.name)).toEqual(["low", "high"]);
 		expect(Codec.instances.at(-1)?.config?.codec).toBe("hvc1.1.6.L93.90");
+	} finally {
+		f.close();
+		await settle();
+	}
+});
+
+test("a pending upgrade cannot move the shared video clock", async () => {
+	const f = fixture();
+	try {
+		await settle();
+		f.send("low", 1000);
+		await settle();
+		f.selected.set("high");
+		await settle();
+		f.send("high", 900);
+		await settle();
+		expect(f.received).toEqual([1000]);
+		expect(f.decoder.out.track.peek()).toBe("low");
+		expect(f.decoder.out.pending.peek()).toBe("high");
+		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(1000));
+	} finally {
+		f.close();
+		await settle();
+	}
+});
+
+test("cancelling an upgrade reuses the playing subscription and retires the trial", async () => {
+	const f = fixture();
+	try {
+		await settle();
+		f.send("low", 1000);
+		await settle();
+		f.selected.set("high");
+		await settle();
+		expect(f.opened[1].options.priority).toBeLessThan(f.opened[0].options.priority ?? 0);
+		f.selected.set("low");
+		await settle();
+		expect(f.opened.map((x) => x.name)).toEqual(["low", "high"]);
+		expect(f.opened[1].sub.closed.peek()).not.toBeUndefined();
+		expect(f.opened[0].sub.closed.peek()).toBeUndefined();
+		expect(f.decoder.out.pending.peek()).toBeUndefined();
+		expect(f.decoder.out.track.peek()).toBe("low");
+		expect(f.resets).toBe(0);
+		f.send("low", 1042);
+		await settle();
+		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(1042));
+	} finally {
+		f.close();
+		await settle();
+	}
+});
+
+test("a downshift cancels obsolete network demand but keeps its displayed frame", async () => {
+	const f = fixture();
+	try {
+		await settle();
+		f.send("low", 1000);
+		await settle();
+		f.selected.set("high");
+		await settle();
+		f.send("high", 1042);
+		await settle();
+		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(1042));
+		const high = f.opened.find((x) => x.name === "high")!;
+		expect(high.sub.subscription.peek()?.priority).toBe(Catalog.PRIORITY.video);
+		f.selected.set("low");
+		await settle();
+		expect(high.sub.closed.peek()).not.toBeUndefined();
+		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(1042));
+		f.send("low", 1084);
+		await settle();
+		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(1084));
+		expect(f.resets).toBe(0);
+	} finally {
+		f.close();
+		await settle();
+	}
+});
+
+test("already decoded old frames drain after a downshift closes their subscription", async () => {
+	const f = fixture();
+	try {
+		await settle();
+		f.send("low", 1000);
+		await settle();
+		f.selected.set("high");
+		await settle();
+		f.send("high", 1042);
+		await settle();
+		f.paced.set(true);
+		await settle();
+		f.send("high", 1084);
+		await settle();
+		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(1042));
+		f.selected.set("low");
+		await settle();
+		expect(f.opened.find((x) => x.name === "high")!.sub.closed.peek()).not.toBeUndefined();
+		f.release();
+		await settle();
+		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(1084));
+		expect(f.resets).toBe(0);
+	} finally {
+		f.close();
+		await settle();
+	}
+});
+
+test("the active rendition still owns genuine publisher rewind recovery", async () => {
+	const f = fixture();
+	try {
+		await settle();
+		f.send("low", 1000);
+		await settle();
+		f.send("low", 100);
+		await settle();
+		expect(f.resets).toBeGreaterThan(0);
+		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(100));
 	} finally {
 		f.close();
 		await settle();
