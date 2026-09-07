@@ -16,26 +16,45 @@ use slab::Slab;
 // - On remove from Vec: pop highest priority item from overflow heap to backfill
 // - On remove from overflow: rebuild heap (rare case, acceptable O(n) cost)
 //
-// Priority ordering: higher track value = higher priority, then higher group value = higher priority
+// Higher track values win. The requested group order breaks ties.
 
 /// A priority composed of a track-level priority and a group sequence number.
-/// Higher `track` is always preferred; `group` only breaks ties within the same track.
+/// Higher `track` is always preferred. Groups default to newest-first; an ordered
+/// subscription reverses the group key without changing track priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Priority {
 	pub track: u8,
 	pub group: u64,
+	ordered: bool,
 }
 
 impl Priority {
 	pub fn new(track: u8, group: u64) -> Self {
-		Self { track, group }
+		Self {
+			track,
+			group,
+			ordered: false,
+		}
+	}
+
+	pub fn with_ordered(mut self, ordered: bool) -> Self {
+		self.ordered = ordered;
+		self
+	}
+
+	fn group_key(self) -> u64 {
+		if self.ordered { !self.group } else { self.group }
 	}
 }
 
 impl Ord for Priority {
 	fn cmp(&self, other: &Self) -> Ordering {
 		// Reverse ordering so highest priority sorts first (index 0)
-		other.track.cmp(&self.track).then(other.group.cmp(&self.group))
+		other
+			.track
+			.cmp(&self.track)
+			.then(other.group_key().cmp(&self.group_key()))
+			.then(self.ordered.cmp(&other.ordered))
 	}
 }
 
@@ -323,13 +342,19 @@ impl PriorityHandle {
 		kio::wait(|waiter| self.poll_next(waiter)).await
 	}
 
-	/// Change this item's track priority and re-sort the queue.
-	/// No-op if the track value hasn't changed.
+	/// Change this item's track priority while preserving its group order.
+	#[cfg(test)]
 	pub fn set_track(&mut self, new_track: u8) {
-		if self.priority.track == new_track {
+		self.set_delivery(new_track, self.priority.ordered);
+	}
+
+	/// Apply both subscription preferences in one queue update.
+	pub fn set_delivery(&mut self, track: u8, ordered: bool) {
+		let updated = Priority::new(track, self.priority.group).with_ordered(ordered);
+		if self.priority == updated {
 			return;
 		}
-		self.priority.track = new_track;
+		self.priority = updated;
 		self.queue.state.lock().unwrap().set_priority(self.id, self.priority);
 	}
 }
@@ -833,5 +858,56 @@ mod tests {
 
 		let promoted = task.await.unwrap();
 		assert!(promoted < u8::MAX, "f1 should be notified of promotion");
+	}
+}
+
+#[cfg(test)]
+mod ordered_tests {
+	use super::*;
+	#[test]
+	fn ordered_groups_reprice_overflow_and_preserve_track_preemption() {
+		let queue = PriorityQueue::default();
+		let mut groups: Vec<_> = (0..260)
+			.map(|seq| queue.insert(Priority::new(50, seq).with_ordered(true)))
+			.collect();
+		assert_eq!(groups[0].send_order(), 255);
+		assert_eq!(groups[259].send_order(), 0);
+		let mut urgent = queue.insert(Priority::new(51, u64::MAX));
+		assert!(urgent.send_order() > groups[0].send_order());
+		drop(urgent);
+		for group in &mut groups {
+			group.set_delivery(50, false);
+		}
+		assert_eq!(groups[259].send_order(), 255);
+		assert_eq!(groups[0].send_order(), 0);
+		for group in &mut groups {
+			group.set_delivery(50, true);
+		}
+		assert_eq!(groups[0].send_order(), 255);
+		assert_eq!(groups[259].send_order(), 0);
+		groups.remove(0);
+		assert_eq!(groups[0].send_order(), 255);
+	}
+	#[test]
+	fn mixed_group_keys_remain_a_total_order_at_sequence_bounds() {
+		let values: Vec<_> = [0, 1]
+			.into_iter()
+			.flat_map(|track| {
+				[false, true].into_iter().flat_map(move |ordered| {
+					[0, 1, u64::MAX - 1, u64::MAX].map(|seq| Priority::new(track, seq).with_ordered(ordered))
+				})
+			})
+			.collect();
+		for a in &values {
+			for b in &values {
+				assert_eq!(a.cmp(b), b.cmp(a).reverse());
+				assert_eq!(a.cmp(b) == Ordering::Equal, a == b);
+				for c in &values {
+					if a <= b && b <= c {
+						assert!(a <= c);
+					}
+				}
+			}
+		}
 	}
 }
