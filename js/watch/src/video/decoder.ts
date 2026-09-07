@@ -56,6 +56,10 @@ export interface Stats {
 }
 
 type DecoderOutput = {
+	/** Track owning the output frames; distinct from Source.out.track during a handoff. */
+	track: Signal<string | undefined>;
+	/** Requested track still preparing; undefined after promotion or cancellation. */
+	pending: Signal<string | undefined>;
 	// The current frame to render.
 	frame: Signal<VideoFrame | undefined>;
 
@@ -79,6 +83,8 @@ export class Decoder {
 	readonly sync: Sync;
 
 	readonly #out: DecoderOutput = {
+		track: new Signal<string | undefined>(undefined),
+		pending: new Signal<string | undefined>(undefined),
 		frame: new Signal<VideoFrame | undefined>(undefined),
 		timestamp: new Signal<Time.Milli | undefined>(undefined),
 		display: new Signal<{ width: number; height: number } | undefined>(undefined),
@@ -146,8 +152,27 @@ export class Decoder {
 			return;
 		}
 
-		// Start a new pending effect.
+		const current = this.#active.peek();
+		// Returning to the playing track cancels the pending effect above. Reuse
+		// that decoder instead of opening a second subscription to the same track.
+		if (
+			current &&
+			!current.downloadStopped &&
+			current.broadcast === active &&
+			current.track === track &&
+			JSON.stringify(current.config) === JSON.stringify(identity.decoder)
+		)
+			return;
+		const renditions = this.source.out.available.peek();
+		const downshift =
+			current !== undefined &&
+			(renditions[track]?.bitrate ?? Infinity) < (renditions[current.track]?.bitrate ?? 0);
+		// Stop obsolete bytes immediately, but let its decoded tail keep playing.
+		if (downshift) current.stopDownload();
+
 		let pending: DecoderTrack | undefined = new DecoderTrack({
+			clockAuthority: current === undefined,
+			priority: current && !downshift ? Catalog.PRIORITY.video - 1 : Catalog.PRIORITY.video,
 			sync: this.sync,
 			paced: this.in.paced,
 			broadcast: active,
@@ -156,7 +181,11 @@ export class Decoder {
 			stats: this.#out.stats,
 		});
 
-		effect.cleanup(() => pending?.close());
+		this.#out.pending.set(track);
+		effect.cleanup(() => {
+			pending?.close();
+			this.#out.pending.set(undefined);
+		});
 
 		effect.run((effect) => {
 			if (!pending) return;
@@ -173,6 +202,10 @@ export class Decoder {
 
 			// Upgrade the pending track to active.
 			// #runActive will be in charge of it now.
+			if (current) current.clockAuthority = false;
+			pending.clockAuthority = true;
+			pending.setPriority(Catalog.PRIORITY.video);
+			this.#out.pending.set(undefined);
 			this.#active.set(pending);
 			pending = undefined;
 
@@ -183,6 +216,7 @@ export class Decoder {
 
 	#runActive(effect: Effect): void {
 		const active = effect.get(this.#active);
+		effect.set(this.#out.track, active?.track);
 		if (!active) {
 			// Clear stale data when disabled (e.g. paused or not visible).
 			this.#out.buffered.set([]);
@@ -251,6 +285,8 @@ export class Decoder {
 }
 
 interface DecoderTrackProps {
+	clockAuthority: boolean;
+	priority: number;
 	sync: Sync;
 	paced: Getter<boolean>;
 	broadcast: Moq.Broadcast.Consumer;
@@ -261,6 +297,22 @@ interface DecoderTrackProps {
 }
 
 class DecoderTrack {
+	clockAuthority: boolean;
+	downloadStopped = false;
+	#subscription?: Moq.Track.Subscriber;
+	#priority: number;
+
+	stopDownload(): void {
+		if (this.downloadStopped) return;
+		this.downloadStopped = true;
+		this.#subscription?.close();
+	}
+
+	setPriority(priority: number): void {
+		this.#priority = priority;
+		if (!this.downloadStopped) this.#subscription?.update({ priority });
+	}
+
 	sync: Sync;
 	paced: Getter<boolean>;
 	broadcast: Moq.Broadcast.Consumer;
@@ -288,6 +340,8 @@ class DecoderTrack {
 	#signals = new Effect();
 
 	constructor(props: DecoderTrackProps) {
+		this.clockAuthority = props.clockAuthority;
+		this.#priority = props.priority;
 		this.sync = props.sync;
 		this.paced = props.paced;
 		this.broadcast = props.broadcast;
@@ -304,7 +358,12 @@ class DecoderTrack {
 	}
 
 	#run(effect: Effect): void {
-		const sub = this.broadcast.track(this.track).subscribe({ priority: Catalog.PRIORITY.video });
+		const sub = this.broadcast.track(this.track).subscribe({ priority: this.#priority });
+		this.#subscription = sub;
+		if (this.downloadStopped) {
+			sub.close();
+			return;
+		}
 		effect.cleanup(() => sub.close());
 
 		const decoder = new VideoDecoder({
@@ -415,7 +474,7 @@ class DecoderTrack {
 
 				// Mark that we received this frame right now.
 				const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
-				this.sync.received(timestamp, "video");
+				if (this.clockAuthority) this.sync.received(timestamp, "video");
 
 				const chunk = new EncodedVideoChunk({
 					type: frame.keyframe ? "key" : "delta",
@@ -492,7 +551,7 @@ class DecoderTrack {
 
 				// Mark that we received this frame right now.
 				const timestamp = Time.Milli.fromMicro(frame.timestamp);
-				this.sync.received(timestamp, "video");
+				if (this.clockAuthority) this.sync.received(timestamp, "video");
 
 				// Track stats
 				this.stats.update((current) => ({
@@ -528,11 +587,12 @@ class DecoderTrack {
 	// last picture shows until the new keyframe renders, instead of flashing empty. Returns true
 	// if a rewind was handled.
 	#onDiscontinuity(count: number): boolean {
-		if (count === this.#discontinuity) return false;
+		// Local cancellation must not look like a publisher rewind.
+		if (this.downloadStopped || count === this.#discontinuity) return false;
 		this.#discontinuity = count;
 		this.timestamp.set(undefined);
 		this.#buffered.set([]);
-		this.sync.reset();
+		if (this.clockAuthority) this.sync.reset();
 		return true;
 	}
 
