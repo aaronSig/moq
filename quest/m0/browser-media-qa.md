@@ -38,5 +38,4 @@ and retain timing samples and traces for diagnosis.
 ## Related
 
 - [Failure artifacts](/quest/m0/qa-failure-artifacts.md) - shared trace and sample output
-- [Republished broadcast](/quest/m0/3363-js-watch-a-broadcast-republished-on-one-session-keeps-resuming.md) - owns the existing resume defect and its focused regression
 - [Open-GOP tune-in](/quest/m2/2067-test-open-gop-h-264-tune-in-end-to-end-leading-picture.md) - owns codec-specific recovery fixtures

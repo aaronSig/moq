@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { expect, mock, spyOn, test } from "bun:test";
+import { Signal } from "@moq/signals";
 import { Producer as BroadcastProducer } from "../broadcast.ts";
 import { error } from "../error.ts";
 import { MAX_GROUP_FRAMES } from "../group.ts";
@@ -96,6 +97,89 @@ function publisher(transport: WebTransport, cluster?: Cluster.Hops): Publisher {
 	const session = new NativeSession(transport, VERSION, true);
 	return new Publisher({ quic: transport, session, requiresSolicitation: false, cluster });
 }
+
+test.each(["acknowledged", "rejected"] as const)(
+	"a replacement waits until its predecessor's FIN is %s",
+	async (result) => {
+		const pair = createMockTransportPair(ALPN.DRAFT_19);
+		const open = pair.server.createBidirectionalStream.bind(pair.server);
+		const closing = Promise.withResolvers<void>();
+		const acknowledged = Promise.withResolvers<void>();
+		let opened = 0;
+		pair.server.createBidirectionalStream = async (options) => {
+			const stream = await open(options);
+			if (++opened !== 1) return stream;
+			const writer = stream.writable.getWriter();
+			return {
+				readable: stream.readable,
+				writable: new WritableStream<Uint8Array>({
+					write: (chunk) => writer.write(chunk),
+					async close() {
+						await writer.close();
+						closing.resolve();
+						await acknowledged.promise;
+					},
+					abort: (reason) => writer.abort(reason),
+				}),
+			} as WebTransportBidirectionalStream;
+		};
+		const pub = publisher(pair.server);
+		const first = new BroadcastProducer();
+		const second = new BroadcastProducer();
+		const changed = Signal.prototype.changed;
+		const disposed = mock(() => {});
+		let registration: ReturnType<typeof spyOn<typeof Signal.prototype, "changed">> | undefined;
+		const loop = pub.runPublishNamespaces();
+		try {
+			pub.publish(Path.from("replacement"), first);
+			const old = await nextStream(pair.client);
+			if (!old) throw new Error("missing initial advertisement");
+			expect(await readPublishNamespace(old)).toBe(Path.from("replacement"));
+			await acceptPublishNamespace(old);
+			registration = spyOn(Signal.prototype, "changed").mockImplementation(function (
+				this: Signal<unknown>,
+				fn?: (value: unknown) => void,
+			) {
+				const original = changed.bind(this);
+				if (!fn) return original();
+				const dispose = original(fn);
+				return () => {
+					dispose();
+					disposed();
+				};
+			} as typeof changed);
+			first.close();
+			pub.publish(Path.from("replacement"), second);
+			await closing.promise;
+			const early = await nextStream(pair.client);
+			early?.abort(new Error("replacement arrived before acknowledgment"));
+			expect(early).toBeUndefined();
+			expect(opened).toBe(1);
+			if (result === "rejected") {
+				expect(disposed).not.toHaveBeenCalled();
+				acknowledged.reject(new Error("FIN acknowledgment failed"));
+				await loop;
+				expect(opened).toBe(1);
+				expect(disposed).toHaveBeenCalled();
+				return;
+			}
+			acknowledged.resolve();
+			const replacement = await nextStream(pair.client);
+			if (!replacement) throw new Error("missing replacement after acknowledgment");
+			expect(await readPublishNamespace(replacement)).toBe(Path.from("replacement"));
+			await acceptPublishNamespace(replacement);
+		} finally {
+			registration?.mockRestore();
+			acknowledged.resolve();
+			first.close();
+			second.close();
+			pub.close();
+			await loop;
+			pair.client.close();
+			pair.server.close();
+		}
+	},
+);
 
 /**
  * Every advertisement waits a round trip for the peer's reply. A broadcast published in

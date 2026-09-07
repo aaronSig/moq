@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Getter } from "@moq/signals";
-import { Producer as BroadcastProducer } from "./broadcast.ts";
+import { type Consumer as BroadcastConsumer, Producer as BroadcastProducer } from "./broadcast.ts";
 import { accept, connect } from "./connection/index.ts";
 import { RemoteError } from "./error.ts";
 import * as Ietf from "./ietf/index.ts";
@@ -1120,6 +1120,67 @@ test("integration: a republish is not served from the previous generation's cach
 	await servingSecond;
 	client.close();
 	server.close();
+});
+
+// #3363: an `invisible muted` <moq-publish> unpublishes and republishes the same path on one
+// session every time it is toggled. Each generation is a new producer under the old name, and the
+// gap between them can be a single microtask, so the announce loop has to key the path on which
+// producer holds it rather than on the path alone.
+async function runRepublishCycle(protocol: string, version?: number) {
+	const pair = createMockTransportPair(protocol);
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, version !== undefined ? { version } : undefined),
+	]);
+
+	const serve = async (broadcast: BroadcastProducer, payload: string) => {
+		for (;;) {
+			const req = await broadcast.requested();
+			if (!req) break;
+			req.accept().writeString(payload);
+		}
+	};
+
+	const watched = client.announcedBroadcast(Path.from("toggle"));
+
+	let previous: BroadcastConsumer | undefined;
+	for (let generation = 0; generation < 3; generation++) {
+		const payload = `gen${generation}`;
+		const producer = new BroadcastProducer();
+		const serving = serve(producer, payload);
+		server.publish(Path.from("toggle"), producer);
+
+		// A dead consumer left in place would still satisfy `!== undefined`, so wait for the swap.
+		const active = await withTimeout(
+			waitFor(watched.active, (b) => b !== undefined && b !== previous),
+			1000,
+			`generation ${generation} never came online`,
+		);
+		if (!active) throw new Error("expected an active broadcast");
+		const frame = withTimeout(
+			active.subscribe("audio").readString(),
+			1000,
+			`generation ${generation} never served a frame`,
+		);
+		expect(await frame).toBe(payload);
+		previous = active;
+
+		// Unpublish, as the element does when it runs out of media, and go straight back around.
+		producer.close();
+		await serving;
+	}
+
+	watched.close();
+	client.close();
+	server.close();
+}
+
+test("integration: lite republish on one session swaps the handle every generation", async () => {
+	await runRepublishCycle(Lite.ALPN_06_WIP);
+});
+
+test("integration: ietf republish on one session swaps the handle every generation", async () => {
+	await runRepublishCycle("", Ietf.Version.DRAFT_14);
 });
 
 test("integration: a blind handle picks up a publisher that arrives late", async () => {

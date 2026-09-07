@@ -150,109 +150,125 @@ export class Publisher {
 	async runAnnounce(msg: AnnounceRequest, stream: Stream) {
 		console.debug(`announce: prefix=${msg.prefix}`);
 
-		// Send initial announcements
-		let active = new Set<Path.Valid>();
-
-		const broadcasts = this.#broadcasts.peek();
-		if (!broadcasts) return; // closed
-
-		for (const name of broadcasts.keys()) {
-			const suffix = Path.stripPrefix(msg.prefix, name);
-			if (suffix === null) continue;
-			console.debug(`announce: broadcast=${name} active=true`);
-			active.add(suffix);
-		}
+		// Which producer holds each announced suffix. Keyed on the producer rather than the path
+		// alone, so a path handed to a new producer is retracted and re-announced instead of
+		// diffing away to nothing and leaving the subscriber on the dead generation.
+		let active = new Map<Path.Valid, broadcast.Producer>();
 
 		// Lite06+: announce ids. Every active we send implicitly assigns the next
 		// per-stream ordinal; ended references the id instead of repeating the path.
 		let nextAnnounceId = 0n;
 		const announceIds = new Map<Path.Valid, bigint>();
 
-		switch (this.version) {
-			case Version.DRAFT_01:
-			case Version.DRAFT_02: {
-				const init = new AnnounceInit([...active]);
-				await init.encode(stream.writer, this.version);
-				break;
+		const announce = async (suffix: Path.Valid, hops: Origin[]) => {
+			console.debug(`announce: broadcast=${suffix} active=true`);
+			if (hasAnnounceId(this.version)) announceIds.set(suffix, nextAnnounceId++);
+			await encodeAnnounceBroadcast(stream.writer, { status: "active", suffix, hops }, this.version);
+		};
+
+		const retract = async (suffix: Path.Valid) => {
+			console.debug(`announce: broadcast=${suffix} active=false`);
+			if (!hasAnnounceId(this.version)) {
+				await encodeAnnounceBroadcast(stream.writer, { status: "ended", suffix }, this.version);
+				return;
 			}
-			default: {
-				if (!hasAnnounceOk(this.version)) {
-					// Draft03/04: send individual Announce messages, stamping our origin as a hop.
-					for (const suffix of active) {
-						await encodeAnnounceBroadcast(
-							stream.writer,
-							{ status: "active", suffix, hops: [this.origin] },
-							this.version,
-						);
+
+			const id = announceIds.get(suffix);
+			announceIds.delete(suffix);
+			if (id === undefined) return; // never announced
+			await encodeAnnounceBroadcast(stream.writer, { status: "endedId", id }, this.version);
+		};
+
+		// Subscribe BEFORE writing anything: every encode below awaits the wire, and a publish
+		// landing in that window only notifies the listeners already registered. One created
+		// afterwards would sleep through it, leaving the change unannounced until something
+		// unrelated moved.
+		// TODO Make a better helper within Signals.
+		let dispose!: Dispose;
+		let changed = new Promise<Map<Path.Valid, broadcast.Producer> | undefined>((resolve) => {
+			dispose = this.#broadcasts.changed(resolve);
+		});
+
+		try {
+			const initial = this.#broadcasts.peek();
+			if (!initial) return; // closed
+
+			for (const [name, producer] of initial) {
+				const suffix = Path.stripPrefix(msg.prefix, name);
+				if (suffix === null) continue;
+				active.set(suffix, producer);
+			}
+
+			switch (this.version) {
+				case Version.DRAFT_01:
+				case Version.DRAFT_02: {
+					for (const suffix of active.keys()) {
+						console.debug(`announce: broadcast=${suffix} active=true`);
+					}
+					const init = new AnnounceInit([...active.keys()]);
+					await init.encode(stream.writer, this.version);
+					break;
+				}
+				default: {
+					if (!hasAnnounceOk(this.version)) {
+						// Draft03/04: send individual Announce messages, stamping our origin as a hop.
+						for (const suffix of active.keys()) {
+							await announce(suffix, [this.origin]);
+						}
+						break;
+					}
+
+					// Report our origin id once via AnnounceOk and the count of initial announces
+					// that follow; the subscriber stamps our origin onto each hop chain, so we omit it.
+					const ok = new AnnounceOk(this.origin, active.size);
+					await ok.encode(stream.writer, this.version);
+					for (const suffix of active.keys()) {
+						await announce(suffix, []);
 					}
 					break;
 				}
+			}
 
-				// Report our origin id once via AnnounceOk and the count of initial announces
-				// that follow; the subscriber stamps our origin onto each hop chain, so we omit it.
-				const ok = new AnnounceOk(this.origin, active.size);
-				await ok.encode(stream.writer, this.version);
-				for (const suffix of active) {
-					if (hasAnnounceId(this.version)) {
-						announceIds.set(suffix, nextAnnounceId++);
-					}
-					await encodeAnnounceBroadcast(stream.writer, { status: "active", suffix, hops: [] }, this.version);
+			// Wait for updates to the broadcasts.
+			for (;;) {
+				// Wait until the map of broadcasts changes.
+				const broadcasts = await Promise.race([changed, stream.reader.closed]);
+				dispose();
+				if (!broadcasts) break;
+
+				// Re-arm before writing, for the same reason as above.
+				changed = new Promise<Map<Path.Valid, broadcast.Producer> | undefined>((resolve) => {
+					dispose = this.#broadcasts.changed(resolve);
+				});
+
+				// Rebuild who holds what.
+				// This is SLOW, but it's not worth optimizing because we often have just 1 broadcast anyway.
+				const updated = new Map<Path.Valid, broadcast.Producer>();
+				for (const [name, producer] of broadcasts) {
+					const suffix = Path.stripPrefix(msg.prefix, name);
+					if (suffix === null) continue; // Not our prefix.
+					updated.set(suffix, producer);
 				}
-				break;
-			}
-		}
 
-		// Wait for updates to the broadcasts.
-		for (;;) {
-			// TODO Make a better helper within Signals.
-			let dispose!: Dispose;
-			const changed = new Promise<Map<Path.Valid, broadcast.Producer> | undefined>((resolve) => {
-				dispose = this.#broadcasts.changed(resolve);
-			});
+				// Retract first, so a replacement reads as an end followed by a start.
+				for (const [suffix, producer] of active) {
+					if (updated.get(suffix) === producer) continue;
+					await retract(suffix);
+				}
 
-			// Wait until the map of broadcasts changes.
-			const broadcasts = await Promise.race([changed, stream.reader.closed]);
-			dispose();
-			if (!broadcasts) break;
-
-			// Create a new set of active broadcasts.
-			// This is SLOW, but it's not worth optimizing because we often have just 1 broadcast anyway.
-			const newActive = new Set<Path.Valid>();
-			for (const name of broadcasts.keys()) {
-				const suffix = Path.stripPrefix(msg.prefix, name);
-				if (suffix === null) continue; // Not our prefix.
-				newActive.add(suffix);
-			}
-
-			// Announce any new broadcasts. Lite05+ reports our origin once via AnnounceOk, so
-			// the subscriber stamps it onto each hop chain; older versions stamp it here.
-			for (const added of newActive.difference(active)) {
-				console.debug(`announce: broadcast=${added} active=true`);
+				// Announce anything new, including a path a different producer now holds. Lite05+
+				// reports our origin once via AnnounceOk, so the subscriber stamps it onto each hop
+				// chain; older versions stamp it here.
 				const hops = hasAnnounceOk(this.version) ? [] : [this.origin];
-				if (hasAnnounceId(this.version)) {
-					announceIds.set(added, nextAnnounceId++);
+				for (const [suffix, producer] of updated) {
+					if (active.get(suffix) === producer) continue;
+					await announce(suffix, hops);
 				}
-				await encodeAnnounceBroadcast(stream.writer, { status: "active", suffix: added, hops }, this.version);
+
+				active = updated;
 			}
-
-			// Announce any removed broadcasts. Lite06+ retracts by announce id;
-			// older versions repeat the path (ended announces don't need hops).
-			for (const removed of active.difference(newActive)) {
-				console.debug(`announce: broadcast=${removed} active=false`);
-				if (hasAnnounceId(this.version)) {
-					const id = announceIds.get(removed);
-					announceIds.delete(removed);
-					if (id === undefined) continue; // never announced
-					await encodeAnnounceBroadcast(stream.writer, { status: "endedId", id }, this.version);
-				} else {
-					await encodeAnnounceBroadcast(stream.writer, { status: "ended", suffix: removed }, this.version);
-				}
-			}
-
-			// NOTE: This is kind of a hack that won't work with a rapid UNANNOUNCE/ANNOUNCE cycle.
-			// However, our client doesn't do that anyway.
-
-			active = newActive;
+		} finally {
+			dispose();
 		}
 	}
 

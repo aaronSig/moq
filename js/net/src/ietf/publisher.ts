@@ -631,7 +631,10 @@ export class Publisher {
 				}
 			};
 
-			let active = new Set<Path.Valid>();
+			// Which producer holds each advertised suffix. Keyed on the producer rather than
+			// the path alone, so a path handed to a new producer is withdrawn and re-offered
+			// instead of diffing away to nothing and leaving the peer on the dead generation.
+			let active = new Map<Path.Valid, broadcast.Producer>();
 			let retry = 0;
 			// What the peer refused, and whether coming back is worth anything.
 			const refused = new Map<Path.Valid, Refused>();
@@ -652,16 +655,16 @@ export class Publisher {
 					break;
 				}
 
-				const updated = new Set<Path.Valid>();
-				for (const name of broadcasts.keys()) {
+				const updated = new Map<Path.Valid, broadcast.Producer>();
+				for (const [name, producer] of broadcasts) {
 					const suffix = Path.stripPrefix(prefix, name);
 					if (suffix === null) continue;
-					updated.add(suffix);
+					updated.set(suffix, producer);
 				}
 
 				// A namespace that is gone takes its refusal with it, so re-announcing the
 				// path offers it again.
-				const live = new Set<Path.Valid>([...updated].map((suffix) => Path.join(prefix, suffix)));
+				const live = new Set<Path.Valid>([...updated.keys()].map((suffix) => Path.join(prefix, suffix)));
 				for (const path of [...refused.keys()]) {
 					if (!live.has(path)) refused.delete(path);
 				}
@@ -669,15 +672,19 @@ export class Publisher {
 				// Track what the peer holds rather than what we attempted: a declined
 				// advertisement stays out of `held`, so the next turn retries it instead of
 				// believing the namespace is already up.
-				const held = new Set<Path.Valid>(active);
-				for (const added of updated.difference(active)) {
-					if (this.#offerable(Path.join(prefix, added), refused)) {
-						if (await advertise(added)) held.add(added);
-					}
+				const held = new Map<Path.Valid, broadcast.Producer>(active);
+
+				// Withdraw first, so a replacement reads as an end followed by a start.
+				for (const [suffix, producer] of active) {
+					if (updated.get(suffix) === producer) continue;
+					await withdraw(suffix);
+					held.delete(suffix);
 				}
-				for (const removed of active.difference(updated)) {
-					await withdraw(removed);
-					held.delete(removed);
+				for (const [suffix, producer] of updated) {
+					if (active.get(suffix) === producer) continue;
+					if (this.#offerable(Path.join(prefix, suffix), refused)) {
+						if (await advertise(suffix)) held.set(suffix, producer);
+					}
 				}
 
 				active = held;
@@ -685,8 +692,9 @@ export class Publisher {
 				// Whatever we wanted up and could not get up, as {@link runPublishNamespaces}
 				// does: only a legacy request can be declined, and nothing about the peer
 				// starting to answer raises a signal this loop is watching.
-				const outstanding = [...updated.difference(active)].some((suffix) =>
-					this.#pending(Path.join(prefix, suffix), refused),
+				const outstanding = [...updated].some(
+					([suffix, producer]) =>
+						active.get(suffix) !== producer && this.#pending(Path.join(prefix, suffix), refused),
 				);
 				retry = outstanding ? Math.min(retry ? retry * 2 : RETRY_BASE, RETRY_MAX) : 0;
 
@@ -732,8 +740,10 @@ export class Publisher {
 		// The open PUBLISH_NAMESPACE request per advertised path.
 		const requests = new Map<Path.Valid, { path: Path.Valid; requestId: bigint; stream: Stream }>();
 
+		let dispose: Dispose | undefined;
 		try {
-			let active = new Set<Path.Valid>();
+			// Which producer holds each advertised path; see {@link runSubscribeNamespace}.
+			let active = new Map<Path.Valid, broadcast.Producer>();
 			let retry = 0;
 			// What the peer refused, and whether coming back is worth anything.
 			const refused = new Map<Path.Valid, Refused>();
@@ -745,18 +755,17 @@ export class Publisher {
 				// through it and leave the namespace unadvertised until something unrelated
 				// changed.
 				// TODO Make a better helper within Signals.
-				let dispose!: Dispose;
 				const changed = new Promise<Map<Path.Valid, broadcast.Producer> | undefined>((resolve) => {
 					dispose = this.#broadcasts.changed(resolve);
 				});
 
 				const broadcasts = this.#broadcasts.peek();
 				if (!broadcasts) {
-					dispose();
+					dispose?.();
 					break;
 				}
 
-				const updated = new Set<Path.Valid>(broadcasts.keys());
+				const updated = new Map<Path.Valid, broadcast.Producer>(broadcasts);
 
 				// A namespace that is gone takes its refusal with it, so re-announcing the
 				// path offers it again. Rust gets this by rebuilding the watched entry.
@@ -764,30 +773,40 @@ export class Publisher {
 					if (!updated.has(path)) refused.delete(path);
 				}
 
-				for (const added of updated.difference(active)) {
-					if (this.#offerable(added, refused)) {
-						await this.#advertise(added, requests, refused);
-					}
+				// Withdraw first, so a replacement reads as an end followed by a start.
+				for (const [path, producer] of active) {
+					if (updated.get(path) === producer) continue;
+					await this.#withdraw(path, requests);
 				}
-				for (const removed of active.difference(updated)) {
-					await this.#withdraw(removed, requests);
+				for (const [path, producer] of updated) {
+					if (active.get(path) === producer) continue;
+					if (this.#offerable(path, refused)) {
+						await this.#advertise(path, requests, refused);
+					}
 				}
 
 				// What the peer holds, not what we attempted: a declined PUBLISH_NAMESPACE
 				// leaves no request behind, so it stays outstanding below.
-				active = new Set<Path.Valid>(requests.keys());
+				const held = new Map<Path.Valid, broadcast.Producer>();
+				for (const path of requests.keys()) {
+					const producer = updated.get(path);
+					if (producer) held.set(path, producer);
+				}
+				active = held;
 
 				// Whatever we wanted up and could not get up. Stream credit freeing, a
 				// transient failure clearing, or the peer starting to answer raises no
 				// signal of its own, so the only way back is to ask again on a timer.
-				const outstanding = [...updated.difference(active)].some((path) => this.#pending(path, refused));
+				const outstanding = [...updated].some(
+					([path, producer]) => active.get(path) !== producer && this.#pending(path, refused),
+				);
 				retry = outstanding ? Math.min(retry ? retry * 2 : RETRY_BASE, RETRY_MAX) : 0;
 
 				// Wait for the next change, which has already fired if one landed above.
 				const next = await (retry
 					? Promise.race([changed, retryAfter(retry).then(() => broadcasts)])
 					: changed);
-				dispose();
+				dispose?.();
 				if (!next) break;
 			}
 		} catch (err: unknown) {
@@ -795,6 +814,7 @@ export class Publisher {
 			// discovery. Not a debug-level event.
 			console.warn(`publish_namespace loop failed: ${reason(error(err))}`);
 		} finally {
+			dispose?.();
 			// Close out every open PUBLISH_NAMESPACE request.
 			for (const path of [...requests.keys()]) {
 				await this.#withdraw(path, requests);
@@ -926,8 +946,14 @@ export class Publisher {
 			} catch {
 				// Stream might already be closed
 			}
+			request.stream.close();
+			return;
 		}
 		request.stream.close();
+		// Wait for transport acknowledgment before opening a replacement request.
+		// This assumes the peer processes the withdrawal by then; FIN acknowledgment
+		// does not itself acknowledge application processing across streams.
+		await request.stream.writer.closed;
 	}
 
 	/**
