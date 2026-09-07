@@ -176,7 +176,31 @@ show a playback error. The player does not silently change codec policy.
 Each reports a track, subscription identity, completed object count, byte count
 and last completion time on the browser monotonic clock. This advances before
 media reordering, decoding or rendering, including while an upgrade is waiting.
+The first read time and first/last delivered group IDs distinguish a history
+request from the group the relay actually delivered.
 Bytes include container headers, exclude transport overhead and retransmissions,
 and must not be treated as spare capacity. These are completed JavaScript reads,
 not packet arrival timestamps. A cancelled subscription disappears; reopening
 the same track gets a new identity and counters.
+
+## Replacement history
+
+Replacement history is an experiment and defaults to off. Enable it explicitly
+with `el.controls.replacementHistory.set(true)` (or the decoder input of the same
+name). The default opens no timeline metadata subscriptions. This bridge is not
+yet qualified for uninterrupted playback under constrained bandwidth.
+
+When a paced downshift has a fresh timeline index, the player requests a recorded
+group at or before the outgoing picture's contiguous buffered tail. This can fill
+the media hole left by starting only at the latest group. It keeps metadata for
+at most eight previously selected renditions, with 64 records/eight seconds per
+index. It never assumes group numbers align between renditions.
+
+The lookup rejects stale indexes and requests no more than two seconds of media
+lookback. Replacement delivery starts in group order with a bounded latency
+budget, returning to normal live priority when it becomes active. Missing or
+unusable timelines retain latest-only delivery. A timeline is a compressed log;
+its initial metadata catchup depends on the publisher's log retention.
+
+`receive.active.startGroup` and `receive.pending.startGroup` identify a recorded
+history request. They are absent when delivery starts at the latest group.

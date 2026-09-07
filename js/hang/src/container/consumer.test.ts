@@ -1225,8 +1225,18 @@ test("receive progress advances before reordered frames are requested", async ()
 		expect(consumer.received.peek().objectsReceived).toBe(1);
 		expect(consumer.received.peek().bytesReceived).toBe(payload.byteLength);
 		expect(consumer.received.peek().lastReceivedAtMs).toBeGreaterThan(0);
+		const first = consumer.received.peek();
+		expect(first.firstGroup).toBe(group.sequence);
+		expect(first.firstReceivedAtMs).toBe(first.lastReceivedAtMs);
 		await consumer.next();
 		expect(consumer.received.peek().objectsReceived).toBe(1);
+		const next = producer.appendGroup();
+		next.writeFrame({ payload, timestamp: Time.Timestamp.fromMicros(Time.Micro(1000)) });
+		next.close();
+		await settle();
+		expect(consumer.received.peek().firstGroup).toBe(group.sequence);
+		expect(consumer.received.peek().lastGroup).toBe(next.sequence);
+		expect(consumer.received.peek().firstReceivedAtMs).toBe(first.firstReceivedAtMs);
 	} finally {
 		consumer.close();
 		producer.close();

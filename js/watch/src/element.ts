@@ -96,6 +96,8 @@ export default class MoqWatch extends HTMLElement {
 		latency: new Signal<Latency>("real-time"),
 		// The desired video rendition (resolution/bitrate cap).
 		target: new Signal<Video.Target | undefined>(undefined),
+		// Opt-in recorded-group replacement experiment; no metadata is downloaded by default.
+		replacementHistory: new Signal(false),
 	};
 
 	// Broadcast configuration owned here and wired into `broadcast` as inputs.
@@ -198,6 +200,7 @@ export default class MoqWatch extends HTMLElement {
 		this.video = new Video.Decoder(videoSource, this.sync, {
 			enabled: this.#videoEnabled,
 			paced: this.#videoPaced,
+			replacementHistory: this.controls.replacementHistory,
 		});
 		this.audio = new Audio.Decoder(audioSource, this.sync, { enabled: this.#audioEnabled });
 		this.signals.cleanup(() => {

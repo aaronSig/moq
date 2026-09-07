@@ -18,6 +18,109 @@ export interface Record {
 	pts: number;
 }
 
+/** A recent group boundary, expressed in milliseconds of media time. */
+export interface Entry {
+	group: number;
+	ptsMs: number;
+}
+
+/** A bounded index for live handoffs. It never extrapolates group numbers between renditions. */
+export class Index {
+	#entries: Entry[] = [];
+	#updatedAt?: number;
+
+	readonly timescale: number;
+	constructor(timescale = DEFAULT_TIMESCALE) {
+		this.timescale = timescale;
+	}
+
+	/** Keep only valid, monotonic records from the current timeline epoch. */
+	push(record: Record, now = performance.now()): void {
+		if (
+			!Number.isSafeInteger(record.group) ||
+			record.group < 0 ||
+			!Number.isSafeInteger(record.pts) ||
+			record.pts < 0 ||
+			!Number.isFinite(this.timescale) ||
+			this.timescale <= 0
+		)
+			return;
+		const entry = { group: record.group, ptsMs: (record.pts * 1000) / this.timescale };
+		if (!Number.isFinite(entry.ptsMs)) return;
+		const last = this.#entries.at(-1);
+		if (last && (entry.group < last.group || entry.ptsMs < last.ptsMs)) this.#entries = [];
+		else if (last && entry.group === last.group) return;
+		this.#entries.push(entry);
+		// Retain at most 64 records and eight seconds, even for an unbounded timeline log.
+		this.#entries = this.#entries.filter((value) => value.ptsMs >= entry.ptsMs - 8000).slice(-64);
+		this.#updatedAt = now;
+	}
+
+	/** Return a recorded group at/before the target, only while both the index and lookback are fresh. */
+	lookup(targetMs: number, maxLookbackMs: number, now = performance.now()): Entry | undefined {
+		if (
+			!Number.isFinite(targetMs) ||
+			!Number.isFinite(maxLookbackMs) ||
+			maxLookbackMs <= 0 ||
+			this.#updatedAt === undefined ||
+			now - this.#updatedAt > 2000 ||
+			now < this.#updatedAt
+		)
+			return;
+		const entry = this.#entries.findLast((value) => value.ptsMs <= targetMs);
+		if (!entry || targetMs - entry.ptsMs > Math.min(2000, maxLookbackMs)) return;
+		return { ...entry };
+	}
+}
+
+/** Keeps a small live index from the advertised compressed timeline. Owns and closes its subscription. */
+export class Consumer {
+	readonly index: Index;
+	#track: Moq.Track.Subscriber;
+	#closed = false;
+
+	constructor(track: Moq.Track.Subscriber, section: Catalog.Timeline) {
+		this.#track = track;
+		const index = new Index(section.timescale);
+		this.index = index;
+		const stream = new Json.Stream.Consumer<Record>(track, { compression: true });
+		void (async () => {
+			try {
+				let batch = 0;
+				for (;;) {
+					const record = await stream.next();
+					if (this.#closed) return;
+					if (record === undefined) {
+						this.close();
+						return;
+					}
+					index.push(record);
+					// A long-running publisher's cached metadata can contain thousands of
+					// immediately available records. Let rendering run between bounded batches.
+					if (++batch === 128) {
+						batch = 0;
+						await new Promise((resolve) => setTimeout(resolve, 0));
+					}
+				}
+			} catch {
+				// Timeline hints must never fail otherwise playable media.
+				this.close();
+			}
+		})();
+	}
+
+	close(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		this.#track.close();
+	}
+
+	/** Look up only while the timeline is still usable. Media playback can fall back to live delivery. */
+	lookup(targetMs: number, maxLookbackMs: number): Entry | undefined {
+		return this.#closed ? undefined : this.index.lookup(targetMs, maxLookbackMs);
+	}
+}
+
 /** The default timeline timescale: 1000 units per second (milliseconds). */
 export const DEFAULT_TIMESCALE = 1000;
 

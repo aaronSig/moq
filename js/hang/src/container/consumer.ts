@@ -117,6 +117,11 @@ export interface ReceiveProgress {
 	bytesReceived: number;
 	/** Browser monotonic time of the last completed read; not packet arrival or decoder input time. */
 	lastReceivedAtMs?: number;
+	/** First completed object read for this subscription, on the same monotonic clock. */
+	firstReceivedAtMs?: number;
+	/** Group identifiers of the first and most recent completed object reads. */
+	firstGroup?: number;
+	lastGroup?: number;
 }
 
 /** Reads frames from a MoQ track in order, buffering groups and skipping slow ones to meet the latency target. */
@@ -224,10 +229,14 @@ export class Consumer {
 			for (;;) {
 				const next = await group.consumer.readFrame();
 				if (!next) break;
+				const receivedAt = performance.now();
 				this.#received.update((previous) => ({
 					objectsReceived: previous.objectsReceived + 1,
 					bytesReceived: previous.bytesReceived + next.payload.byteLength,
-					lastReceivedAtMs: performance.now(),
+					lastReceivedAtMs: receivedAt,
+					firstReceivedAtMs: previous.firstReceivedAtMs ?? receivedAt,
+					firstGroup: previous.firstGroup ?? group.consumer.sequence,
+					lastGroup: group.consumer.sequence,
 				}));
 				group.empty = false;
 
