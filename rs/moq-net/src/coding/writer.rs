@@ -88,15 +88,17 @@ impl<S: web_transport_trait::SendStream, V> Writer<S, V> {
 	/// [`Self::finish`] alone is not enough to deliver a final message. A stream that has sent
 	/// its FIN is still retransmitting unacknowledged data, and a RESET_STREAM from that state
 	/// discards it, so the [`Drop`] fallback below can throw away bytes the peer never read.
-	/// Consuming the writer is what removes that fallback, and waiting for the acknowledgement
-	/// is what makes the bytes safe.
+	/// Keep the Drop fallback armed while awaiting acknowledgement: cancelling an
+	/// obsolete subscription must still reset its queued reliable bytes. Only a
+	/// successful acknowledgement disarms it, so normal completion never resets.
 	pub async fn close(mut self) -> Result<(), Error> {
-		let Some(mut stream) = self.stream.take() else {
+		let Some(stream) = self.stream.as_mut() else {
 			return Ok(());
 		};
 
 		stream.finish().map_err(Error::from_transport)?;
 		stream.closed().await.map_err(Error::from_transport)?;
+		self.stream.take();
 
 		Ok(())
 	}
@@ -154,6 +156,84 @@ impl<S: web_transport_trait::SendStream, V> Drop for Writer<S, V> {
 mod tests {
 	use super::*;
 	use crate::lite::test_transport::{Log, SinkSend};
+
+	struct AckGatedSend {
+		inner: SinkSend,
+		ack: kio::Consumer<bool>,
+	}
+
+	impl web_transport_trait::SendStream for AckGatedSend {
+		type Error = crate::lite::test_transport::SinkError;
+		async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+			web_transport_trait::SendStream::write(&mut self.inner, buf).await
+		}
+		fn set_priority(&mut self, order: u8) {
+			web_transport_trait::SendStream::set_priority(&mut self.inner, order);
+		}
+		fn finish(&mut self) -> Result<(), Self::Error> {
+			web_transport_trait::SendStream::finish(&mut self.inner)
+		}
+		fn reset(&mut self, code: u32) {
+			web_transport_trait::SendStream::reset(&mut self.inner, code);
+		}
+		async fn closed(&mut self) -> Result<(), Self::Error> {
+			self.ack
+				.wait(|ack| {
+					if **ack {
+						std::task::Poll::Ready(())
+					} else {
+						std::task::Poll::Pending
+					}
+				})
+				.await
+				.map_err(|_| crate::lite::test_transport::SinkError)?;
+			web_transport_trait::SendStream::closed(&mut self.inner).await
+		}
+	}
+
+	#[tokio::test]
+	async fn cancel_close_before_ack_resets_queued_data() {
+		let log = Log::default();
+		let ack = kio::Producer::new(false);
+		let send = AckGatedSend {
+			inner: SinkSend::new(log.clone()),
+			ack: ack.consume(),
+		};
+		let mut writer = Writer::new(send, crate::lite::Version::Lite05);
+		writer
+			.write_chunk(bytes::Bytes::from_static(b"obsolete video"))
+			.await
+			.unwrap();
+		let mut close = Box::pin(writer.close());
+		assert!(futures::poll!(close.as_mut()).is_pending());
+		drop(close);
+		assert_eq!(
+			log.resets(),
+			vec![Error::Cancel.to_code()],
+			"cancelled FIN wait left obsolete bytes queued"
+		);
+	}
+
+	#[tokio::test]
+	async fn close_after_delayed_ack_never_resets() {
+		let log = Log::default();
+		let ack = kio::Producer::new(false);
+		let send = AckGatedSend {
+			inner: SinkSend::new(log.clone()),
+			ack: ack.consume(),
+		};
+		let mut writer = Writer::new(send, crate::lite::Version::Lite05);
+		writer
+			.write_chunk(bytes::Bytes::from_static(b"complete video"))
+			.await
+			.unwrap();
+		let mut close = Box::pin(writer.close());
+		assert!(futures::poll!(close.as_mut()).is_pending());
+		*ack.write().ok().unwrap() = true;
+		close.await.unwrap();
+		assert!(log.resets().is_empty());
+		assert_eq!(*log.writes.lock().unwrap(), b"complete video");
+	}
 
 	#[test]
 	fn set_priority_forwards_send_order() {
