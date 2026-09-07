@@ -185,6 +185,11 @@ the same track gets a new identity and counters.
 
 ## Replacement history
 
+Replacement history is an experiment and defaults to off. Enable it explicitly
+with `el.controls.replacementHistory.set(true)` (or the decoder input of the same
+name). The default opens no timeline metadata subscriptions. This bridge is not
+yet qualified for uninterrupted playback under constrained bandwidth.
+
 When a paced downshift has a fresh timeline index, the player requests a recorded
 group at or before the outgoing picture's contiguous buffered tail. This can fill
 the media hole left by starting only at the latest group. It keeps metadata for

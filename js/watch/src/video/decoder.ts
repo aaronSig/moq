@@ -44,6 +44,9 @@ export type DecoderInput = {
 	 * else reading it (captions, the UI) still works and re-enabling this resumes cleanly.
 	 */
 	paced: Getter<boolean>;
+
+	/** Experimental recorded-group downshift bridge. Defaults to false; metadata demand is opt-in. */
+	replacementHistory: Getter<boolean>;
 };
 
 /** Cumulative video statistics since the decoder started. */
@@ -144,6 +147,7 @@ export class Decoder {
 		this.in = {
 			enabled: getter(props?.enabled ?? false),
 			paced: getter(props?.paced ?? true),
+			replacementHistory: getter(props?.replacementHistory ?? false),
 		};
 
 		this.source = source;
@@ -159,6 +163,7 @@ export class Decoder {
 
 		this.#signals.run((effect) => {
 			effect.get(this.in.enabled);
+			effect.get(this.in.replacementHistory);
 			effect.get(this.source.in.broadcast);
 			effect.cleanup(() => {
 				for (const value of this.#timelines) value.reader.close();
@@ -195,18 +200,9 @@ export class Decoder {
 
 		this.#out.error.set(undefined);
 		const current = this.#active.peek();
-		// Returning to the playing track cancels the pending effect above. Reuse
-		// that decoder instead of opening a second subscription to the same track.
-		if (
-			current &&
-			!current.downloadStopped &&
-			current.broadcast === active &&
-			current.track === track &&
-			JSON.stringify(current.config) === JSON.stringify(identity.decoder)
-		)
-			return;
 		const renditions = this.source.out.available.peek();
-		const section = renditions[track]?.timeline;
+		const useHistory = effect.get(this.in.replacementHistory);
+		const section = useHistory ? renditions[track]?.timeline : undefined;
 		let timeline = this.#timelines.find((value) => value.broadcast === active && value.track === track);
 		if (timeline && timeline.section !== JSON.stringify(section)) {
 			timeline.reader.close();
@@ -224,6 +220,16 @@ export class Decoder {
 			timeline = { broadcast: active, track, section: JSON.stringify(section), reader };
 			this.#timelines.push(timeline);
 		}
+		// Returning to the playing track cancels the pending effect above. Reuse
+		// that decoder instead of opening a second subscription to the same track.
+		if (
+			current &&
+			!current.downloadStopped &&
+			current.broadcast === active &&
+			current.track === track &&
+			JSON.stringify(current.config) === JSON.stringify(identity.decoder)
+		)
+			return;
 		const downshift =
 			current !== undefined &&
 			(renditions[track]?.bitrate ?? Infinity) < (renditions[current.track]?.bitrate ?? 0);
@@ -236,7 +242,7 @@ export class Decoder {
 				if (range.end > tail) tail = range.end;
 			}
 		const history =
-			downshift && tail !== undefined && this.in.paced.peek()
+			useHistory && downshift && tail !== undefined && this.in.paced.peek()
 				? timeline?.reader.lookup(tail, Math.min(2000, this.sync.out.buffer.peek() + 1000))
 				: undefined;
 		// Stop obsolete bytes immediately, but let its decoded tail keep playing.

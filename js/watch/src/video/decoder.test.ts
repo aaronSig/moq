@@ -69,7 +69,7 @@ afterEach(() => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 });
-function fixture(withTimeline = false) {
+function fixture(withTimeline = false, historyEnabled: boolean | undefined = undefined) {
 	const low = Catalog.VideoConfigSchema.parse({
 		codec: "avc1.64001f",
 		bitrate: 400_000,
@@ -118,7 +118,8 @@ function fixture(withTimeline = false) {
 		},
 		wait: () => new Promise<void>((resolve) => waits.push(resolve)),
 	} as unknown as Sync;
-	const decoder = new Decoder(source, sync, { enabled: true, paced });
+	const replacementHistory = historyEnabled === undefined ? undefined : new Signal(historyEnabled);
+	const decoder = new Decoder(source, sync, { enabled: true, paced, replacementHistory });
 	function send(name: keyof typeof producers, pts: number) {
 		const group = producers[name].appendGroup();
 		group.writeFrame({
@@ -129,6 +130,7 @@ function fixture(withTimeline = false) {
 	}
 	return {
 		timeline,
+		replacementHistory,
 		sync,
 		buffer,
 		decoder,
@@ -152,8 +154,54 @@ function fixture(withTimeline = false) {
 	};
 }
 
-test("downshift requests a bounded group from its own warm timeline and keeps retired media closed", async () => {
+test("advertised timelines create no demand unless replacement history is enabled", async () => {
 	const f = fixture(true);
+	try {
+		await settle();
+		f.send("low", 1000);
+		await settle();
+		f.selected.set("high");
+		await settle();
+		f.send("high", 1500);
+		await settle();
+		f.paced.set(true);
+		f.selected.set("low");
+		await settle();
+		expect(f.decoder.in.replacementHistory.peek()).toBe(false);
+		expect(f.opened.filter((value) => value.name === "low.timeline.z")).toHaveLength(0);
+		expect(f.opened.filter((value) => value.name === "low").at(-1)?.options.startGroup).toBeUndefined();
+	} finally {
+		f.close();
+		await settle();
+	}
+});
+
+test("disabling replacement history closes metadata without replacing the playing decoder", async () => {
+	const f = fixture(true, true);
+	try {
+		await settle();
+		f.send("low", 1000);
+		await settle();
+		const media = f.opened.find((value) => value.name === "low");
+		const metadata = f.opened.find((value) => value.name === "low.timeline.z");
+		expect(metadata).toBeDefined();
+		f.replacementHistory?.set(false);
+		await settle();
+		expect(metadata?.sub.closed.peek()).toBeDefined();
+		expect(media?.sub.closed.peek()).toBeUndefined();
+		expect(f.opened.filter((value) => value.name === "low")).toHaveLength(1);
+		f.replacementHistory?.set(true);
+		await settle();
+		expect(f.opened.filter((value) => value.name === "low.timeline.z")).toHaveLength(2);
+		expect(f.opened.filter((value) => value.name === "low")).toHaveLength(1);
+	} finally {
+		f.close();
+		await settle();
+	}
+});
+
+test("downshift requests a bounded group from its own warm timeline and keeps retired media closed", async () => {
+	const f = fixture(true, true);
 	try {
 		await settle();
 		f.send("low", 1000);
