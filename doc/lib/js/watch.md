@@ -41,13 +41,93 @@ The overlay adds play/pause, volume, fullscreen, a quality selector, a
 buffering indicator, an unsupported-codec warning, and a stats panel.
 `<moq-watch-support>` shows what the browser can play.
 
+## Binding from a framework
+
+`import "@moq/watch/element"` registers `<moq-watch>` while the module
+evaluates, so a browser-only entrypoint that imports it before mounting gets an
+upgraded element. `el.broadcast`, `el.video`, `el.audio`, `el.sync`, and
+`el.signals` are assigned by the constructor and readable right away.
+
+Defer the import and that guarantee goes with it. A dynamic `import()` inside
+`onMount`, one behind a `browser` guard, or a `<script>` that loads after the
+markup all leave the tag unregistered until they land, and an element of an
+unregistered tag is a plain `HTMLElement`. A framework binding
+(Svelte's `bind:this`, React's `ref`) hands you that un-upgraded node, where
+every property reads `undefined`:
+
+```ts
+// TypeError: el.broadcast is undefined
+el.broadcast.out.catalog.subscribe(handler);
+```
+
+The browser upgrades the same node once the definition arrives, applying the
+attributes it already has. Use a static import in browser-only entrypoints.
+For SSR applications, run the following in a client-side mount hook, after
+the node exists. The element module needs browser globals and must not be
+imported during server rendering. Start the import before waiting for registration:
+
+```ts
+await import("@moq/watch/element");
+await customElements.whenDefined("moq-watch");
+el.broadcast.out.catalog.subscribe(handler);
+```
+
 ## Custom tracks
 
-`broadcast.subscribeTrack(name, priority, consume)` follows the active
-broadcast across reconnects for any application track, and the loose catalog
-passes your own sections through to `broadcast.catalog`. Decode JSON with
-`@moq/json`. Reach the pipeline from the element via `el.broadcast`,
-`el.video`, `el.audio`, and `el.signals`.
+The catalog schema is loose: sections `@moq/hang` doesn't recognize are passed
+through to `broadcast.out.catalog`, a read-only signal you react to like any
+other. Subscribe to the track it names off `broadcast.out.active`, the live
+broadcast consumer, and decode JSON with
+[`@moq/json`](https://www.npmjs.com/package/@moq/json).
+
+```ts
+import * as Json from "@moq/json";
+import { Hang } from "@moq/watch";
+
+// Run after the element module has loaded and the node has mounted.
+const el = document.querySelector("moq-watch");
+if (!el) throw new Error("Missing <moq-watch> element");
+
+const dispose = el.signals.run((effect) => {
+    const catalog = effect.get(el.broadcast.out.catalog) as { metadata?: unknown } | undefined;
+    const active = effect.get(el.broadcast.out.active);
+
+    const metadata = catalog?.metadata;
+    if (metadata !== undefined &&
+        (!Array.isArray(metadata) || !metadata.every((name): name is string => typeof name === "string"))) {
+        throw new Error("Expected metadata to be an array of track names");
+    }
+    const name = metadata?.[0];
+    if (!active || !name) return;
+
+    const track = active.track(name).subscribe({ priority: Hang.Catalog.PRIORITY.catalog });
+    effect.cleanup(() => track.close());
+
+    const consumer = new Json.Snapshot.Consumer<unknown>(track);
+    effect.spawn(async () => {
+        for (;;) {
+            const value = await Promise.race([effect.cancel, consumer.next()]);
+            if (value === undefined) break;
+            console.log("metadata", value);
+        }
+    });
+});
+```
+
+Call `dispose()` from your framework's unmount cleanup when this subscription
+is no longer needed. Removing the element disables playback but keeps its
+effects open so the same node can reconnect.
+
+The effect re-runs whenever the catalog or the active broadcast changes, so a
+reconnect resubscribes on its own. A publisher that rewrites its catalog often
+(a live encoder tweak) re-runs it too; memoize the track name with
+`effect.computed` when that matters, as the
+[watch demo](https://github.com/moq-dev/moq/blob/main/demo/web/src/index.ts)
+does.
+
+`el.catalog` is the same value read once, without subscribing. Reach the rest
+of the pipeline through `el.broadcast`, `el.video`, `el.audio`, and
+`el.signals`.
 
 ## Without the element
 
