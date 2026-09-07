@@ -5,6 +5,20 @@ use moq_net::Timestamp;
 
 use super::{Container, Frame};
 
+// A clean FIN survives cache eviction. poll_finished() alone therefore cannot
+// tell whether unread payloads were lost after FIN. Inspect the typed transport
+// cause through container wrappers; malformed media must still propagate.
+fn is_eviction(error: &(dyn std::error::Error + 'static)) -> bool {
+	let mut cause = Some(error);
+	while let Some(error) = cause {
+		if let Some(error) = error.downcast_ref::<moq_net::Error>() {
+			return matches!(error, moq_net::Error::Old | moq_net::Error::Lagged);
+		}
+		cause = error.source();
+	}
+	false
+}
+
 /// Decode a moq-lite track into a stream of media [`Frame`]s in latency-bounded
 /// presentation order.
 ///
@@ -279,7 +293,7 @@ impl<F: Container> Consumer<F> {
 						// poll_finished, while a malformed payload leaves the group live or
 						// cleanly finished. A decode error is real and the caller must see it,
 						// not have the group silently dropped.
-						if !group.poll_aborted(waiter) {
+						if !group.poll_aborted(waiter) && !is_eviction(&e) {
 							return Poll::Ready(Err(e));
 						}
 						// The group aged out of the relay cache (`Error::Old`) or was otherwise
@@ -1555,6 +1569,36 @@ mod tests {
 			.unwrap()
 			.unwrap();
 		assert_eq!(next.timestamp, ts(150_000), "skipped the evicted gap to the live group");
+	}
+
+	#[test]
+	fn eviction_classification_unwraps_cmaf_without_hiding_bad_media() {
+		assert!(is_eviction(&crate::Error::Cmaf(crate::container::fmp4::Error::Moq(moq_net::Error::Old))));
+		assert!(is_eviction(&crate::Error::Cmaf(crate::container::fmp4::Error::Moq(moq_net::Error::Lagged))));
+		assert!(!is_eviction(&crate::Error::Cmaf(crate::container::fmp4::Error::NoMoof)));
+	}
+
+	/// FIN does not guarantee unread payloads are still cached. A later eviction
+	/// preserves poll_finished()'s clean FIN but read_frame() must report Old.
+	#[tokio::test]
+	async fn finished_then_evicted_group_resumes_at_live_keyframe() {
+		let mut track = track_producer("test", hang::container::track_info());
+		let consumer_track = track.subscribe(None);
+		let mut consumer = Consumer::new(consumer_track, Container::Legacy).with_latency(Duration::from_millis(100));
+		let mut group = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		for timestamp in [0, 33_000, 66_000] {
+			Container::Legacy.write(&mut group, &[Frame {
+				timestamp: ts(timestamp), payload: Bytes::from_static(&[0xDE, 0xAD]),
+				keyframe: false, duration: None,
+			}]).unwrap();
+		}
+		group.finish().unwrap();
+		assert_eq!(consumer.read().await.unwrap().unwrap().timestamp, ts(0));
+		write_group(&mut track, 5, &[ts(150_000)]);
+		group.abort(moq_net::Error::Old).unwrap();
+		let next = tokio::time::timeout(Duration::from_secs(1), consumer.read()).await
+			.expect("finished, evicted group blocked the live reader").unwrap().unwrap();
+		assert_eq!(next.timestamp, ts(150_000));
 	}
 
 	/// A missing (evicted) sequence with a newer group buffered must be skipped once the
