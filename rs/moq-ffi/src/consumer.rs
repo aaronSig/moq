@@ -110,6 +110,40 @@ impl MoqBroadcastConsumer {
 	pub(crate) fn inner(&self) -> &moq_net::broadcast::Consumer {
 		&self.inner
 	}
+
+	async fn media_subscription(
+		&self,
+		name: String,
+		container: MoqContainer,
+		subscription: Option<MoqSubscription>,
+		fresh_live: bool,
+	) -> Result<Arc<MoqMediaConsumer>, MoqError> {
+		// Parse before registering demand, preserving the existing failure cleanup.
+		let media = media_container(container)?;
+		let subscription = subscription.map(moq_net::track::Subscription::from).unwrap_or_default();
+		let latency = subscription.latency_max;
+		let handle = self.inner.track(&name)?;
+		// Snapshot BEFORE registering demand: a newly received current GOP must
+		// remain eligible even if it races subscription confirmation. This changes
+		// only the local cursor, never the live-edge wire request or reorder budget.
+		// Explicit historical/bounded requests retain their existing semantics.
+		let floor = if fresh_live && subscription.group_start.is_none() && subscription.group_end.is_none() {
+			handle
+				.latest()
+				.map(|sequence| sequence.checked_add(1).ok_or(MoqError::Closed))
+				.transpose()?
+		} else {
+			None
+		};
+		let mut track = handle.subscribe(subscription).await?;
+		if let Some(floor) = floor {
+			track.start_at(floor);
+		}
+		let consumer = moq_mux::container::Consumer::new(track, media).with_latency(latency);
+		Ok(Arc::new(MoqMediaConsumer {
+			task: Task::new(Media { inner: consumer }),
+		}))
+	}
 }
 
 /// A watch over a broadcast's route. Created by `MoqBroadcastConsumer::route_updates`.
@@ -283,16 +317,26 @@ impl MoqBroadcastConsumer {
 		container: MoqContainer,
 		subscription: Option<MoqSubscription>,
 	) -> Result<Arc<MoqMediaConsumer>, MoqError> {
-		// Parse the container before subscribing so we don't leave a dangling
-		// subscription if init parsing fails.
-		let media = media_container(container)?;
-		let subscription = subscription.map(moq_net::track::Subscription::from).unwrap_or_default();
-		let latency = subscription.latency_max;
-		let track = self.inner.track(&name)?.subscribe(subscription).await?;
-		let consumer = moq_mux::container::Consumer::new(track, media).with_latency(latency);
-		Ok(Arc::new(MoqMediaConsumer {
-			task: Task::new(Media { inner: consumer }),
-		}))
+		self.media_subscription(name, container, subscription, false).await
+	}
+
+	/// Start a live media reader after any groups already cached locally.
+	///
+	/// Opt-in for a new live video rendition: cached media from an earlier
+	/// subscription must not anchor its jitter buffer behind an unrequested gap.
+	/// A track with no cached edge starts with the first arriving group as usual.
+	/// The wire request remains live-edge and keeps the requested latency/priority.
+	/// Explicit group-start or group-end requests keep ordinary cached delivery.
+	///
+	/// A quiet track waits for its next group; callers wanting its last cached
+	/// picture or a completed recording should use `subscribe_media` instead.
+	pub async fn subscribe_media_live(
+		&self,
+		name: String,
+		container: MoqContainer,
+		subscription: Option<MoqSubscription>,
+	) -> Result<Arc<MoqMediaConsumer>, MoqError> {
+		self.media_subscription(name, container, subscription, true).await
 	}
 }
 
@@ -546,5 +590,251 @@ impl MoqMediaConsumer {
 	/// Cancel all current and future `next()` calls.
 	pub fn cancel(&self) {
 		self.task.cancel();
+	}
+}
+
+#[cfg(test)]
+mod lab_live_subscription {
+	use super::*;
+	use moq_mux::container::Container as _;
+	use std::task::Poll;
+	use std::time::Duration;
+
+	fn ts(us: u64) -> moq_net::Timestamp {
+		moq_net::Timestamp::from_micros(us).unwrap()
+	}
+	fn fixture() -> (
+		moq_net::broadcast::Producer,
+		MoqBroadcastConsumer,
+		moq_net::track::Producer,
+	) {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast.create_track("video", hang::container::track_info()).unwrap();
+		let ffi = MoqBroadcastConsumer::new(broadcast.consume());
+		(broadcast, ffi, track)
+	}
+	fn group(track: &mut moq_net::track::Producer, sequence: u64, us: u64) {
+		let mut g = track.create_group(moq_net::group::Info { sequence }).unwrap();
+		moq_mux::catalog::hang::Container::Legacy
+			.write(
+				&mut g,
+				&[moq_mux::container::Frame {
+					timestamp: ts(us),
+					payload: bytes::Bytes::from_static(&[1]),
+					keyframe: true,
+					duration: None,
+				}],
+			)
+			.unwrap();
+		g.finish().unwrap();
+	}
+	fn prefs(start: Option<u64>, end: Option<u64>) -> Option<MoqSubscription> {
+		Some(MoqSubscription {
+			priority: 60,
+			ordered: false,
+			latency_max_ms: 700,
+			group_start: start,
+			group_end: end,
+		})
+	}
+	fn poll(media: &MoqMediaConsumer) -> Poll<Result<Option<moq_mux::container::Frame>, moq_mux::Error>> {
+		media.task.lock().unwrap().inner.poll_read(&kio::Waiter::noop())
+	}
+	fn pts(media: &MoqMediaConsumer) -> u64 {
+		match poll(media) {
+			Poll::Ready(Ok(Some(frame))) => frame.timestamp.as_micros() as u64,
+			other => panic!("expected available frame, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn live_resubscription_avoids_the_cached_sequence_gap() {
+		let (_broadcast, ffi, mut track) = fixture();
+		group(&mut track, 0, 0);
+		let old = ffi
+			.subscribe_media("video".into(), MoqContainer::Legacy, prefs(None, None))
+			.await
+			.unwrap();
+		assert_eq!(pts(&old), 0);
+		old.cancel();
+		drop(old);
+		let new = ffi
+			.subscribe_media_live("video".into(), MoqContainer::Legacy, prefs(None, None))
+			.await
+			.unwrap();
+		assert!(poll(&new).is_pending(), "stale cache must not anchor the new reader");
+		group(&mut track, 120, 30_000_000);
+		assert_eq!(pts(&new), 30_000_000, "must not wait another700ms of media");
+		let demand = track.subscription().unwrap();
+		assert_eq!(demand.latency_max, Duration::from_millis(700));
+		assert_eq!(demand.priority, 60);
+		assert!(!demand.ordered);
+		assert_eq!(demand.group_start, None);
+		assert_eq!(demand.group_end, None);
+	}
+
+	#[tokio::test]
+	async fn live_first_subscription_keeps_first_arriving_group() {
+		let (_broadcast, ffi, mut track) = fixture();
+		let media = ffi
+			.subscribe_media_live("video".into(), MoqContainer::Legacy, prefs(None, None))
+			.await
+			.unwrap();
+		group(&mut track, 120, 30_000_000);
+		let frame = tokio::time::timeout(Duration::from_secs(2), media.next())
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert_eq!(frame.timestamp_us, 30_000_000);
+	}
+
+	#[tokio::test]
+	async fn ordinary_subscription_keeps_cached_picture() {
+		let (_broadcast, ffi, mut track) = fixture();
+		group(&mut track, 0, 0);
+		let media = ffi
+			.subscribe_media("video".into(), MoqContainer::Legacy, prefs(None, None))
+			.await
+			.unwrap();
+		assert_eq!(pts(&media), 0);
+	}
+
+	#[tokio::test]
+	async fn explicit_history_keeps_requested_cached_groups() {
+		for (start, end) in [(Some(0), None), (None, Some(0)), (Some(0), Some(0))] {
+			let (_broadcast, ffi, mut track) = fixture();
+			group(&mut track, 0, 0);
+			let media = ffi
+				.subscribe_media_live("video".into(), MoqContainer::Legacy, prefs(start, end))
+				.await
+				.unwrap();
+			assert_eq!(pts(&media), 0);
+			let demand = track.subscription().unwrap();
+			assert_eq!(demand.group_start, start);
+			assert_eq!(demand.group_end, end);
+		}
+	}
+
+	#[tokio::test]
+	async fn fresh_cursor_does_not_mutate_an_existing_reader() {
+		let (_broadcast, ffi, mut track) = fixture();
+		group(&mut track, 0, 0);
+		let ordinary = ffi
+			.subscribe_media("video".into(), MoqContainer::Legacy, prefs(None, None))
+			.await
+			.unwrap();
+		let live = ffi
+			.subscribe_media_live("video".into(), MoqContainer::Legacy, prefs(None, None))
+			.await
+			.unwrap();
+		assert!(poll(&live).is_pending());
+		assert_eq!(pts(&ordinary), 0);
+		group(&mut track, 120, 30_000_000);
+		assert_eq!(pts(&live), 30_000_000);
+	}
+
+	#[tokio::test]
+	async fn quiet_live_subscription_is_cancellable_and_releases_demand() {
+		let (_broadcast, ffi, mut track) = fixture();
+		group(&mut track, 0, 0);
+		let live = ffi
+			.subscribe_media_live("video".into(), MoqContainer::Legacy, prefs(None, None))
+			.await
+			.unwrap();
+		assert!(poll(&live).is_pending());
+		live.cancel();
+		assert!(matches!(live.next().await, Err(MoqError::Cancelled)));
+		drop(live);
+		assert!(track.subscription().is_none());
+	}
+
+	#[tokio::test]
+	async fn malformed_container_does_not_register_a_subscription() {
+		let (_broadcast, ffi, track) = fixture();
+		assert!(
+			ffi.subscribe_media_live("video".into(), MoqContainer::Cmaf { init: vec![] }, prefs(None, None))
+				.await
+				.is_err()
+		);
+		assert!(track.subscription().is_none());
+	}
+
+	#[tokio::test]
+	async fn maximum_cached_sequence_cannot_wrap_into_history() {
+		let (_broadcast, ffi, mut track) = fixture();
+		group(&mut track, u64::MAX, 0);
+		assert!(matches!(
+			ffi.subscribe_media_live("video".into(), MoqContainer::Legacy, prefs(None, None))
+				.await,
+			Err(MoqError::Closed)
+		));
+		assert!(track.subscription().is_none());
+	}
+
+	#[tokio::test]
+	async fn live_resubscription_through_a_spliced_origin_skips_old_cache() {
+		let origin = moq_net::Origin::random().produce().with_linger(Duration::from_secs(60));
+		let mut source = origin
+			.create_broadcast("live", moq_net::broadcast::Route::announced())
+			.unwrap();
+		let mut track = source.create_track("video", hang::container::track_info()).unwrap();
+		group(&mut track, 0, 0);
+		let front = tokio::time::timeout(Duration::from_secs(2), origin.consume().announced_broadcast("live"))
+			.await
+			.unwrap()
+			.unwrap();
+		let ffi = MoqBroadcastConsumer::new(front);
+		let original = tokio::time::timeout(
+			Duration::from_secs(2),
+			ffi.subscribe_media("video".into(), MoqContainer::Legacy, prefs(None, None)),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let first = tokio::time::timeout(Duration::from_secs(2), original.next())
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert_eq!(first.timestamp_us, 0);
+		original.cancel();
+		drop(original);
+		let live = tokio::time::timeout(
+			Duration::from_secs(2),
+			ffi.subscribe_media_live("video".into(), MoqContainer::Legacy, prefs(None, None)),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		assert!(poll(&live).is_pending(), "logical track must not replay cached0");
+		group(&mut track, 120, 30_000_000);
+		let new = tokio::time::timeout(Duration::from_secs(2), live.next())
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert_eq!(new.timestamp_us, 30_000_000);
+		live.cancel();
+	}
+
+	#[tokio::test]
+	async fn fresh_start_preserves_reordering_after_the_first_new_group() {
+		let (_broadcast, ffi, mut track) = fixture();
+		group(&mut track, 0, 0);
+		let live = ffi
+			.subscribe_media_live("video".into(), MoqContainer::Legacy, prefs(None, None))
+			.await
+			.unwrap();
+		group(&mut track, 120, 30_000_000);
+		assert_eq!(pts(&live), 30_000_000);
+		group(&mut track, 122, 30_500_000);
+		assert!(
+			poll(&live).is_pending(),
+			"a within-budget missing group remains eligible"
+		);
+		group(&mut track, 121, 30_250_000);
+		assert_eq!(pts(&live), 30_250_000);
+		assert_eq!(pts(&live), 30_500_000);
 	}
 }

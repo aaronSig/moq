@@ -1573,8 +1573,12 @@ mod tests {
 
 	#[test]
 	fn eviction_classification_unwraps_cmaf_without_hiding_bad_media() {
-		assert!(is_eviction(&crate::Error::Cmaf(crate::container::fmp4::Error::Moq(moq_net::Error::Old))));
-		assert!(is_eviction(&crate::Error::Cmaf(crate::container::fmp4::Error::Moq(moq_net::Error::Lagged))));
+		assert!(is_eviction(&crate::Error::Cmaf(crate::container::fmp4::Error::Moq(
+			moq_net::Error::Old
+		))));
+		assert!(is_eviction(&crate::Error::Cmaf(crate::container::fmp4::Error::Moq(
+			moq_net::Error::Lagged
+		))));
 		assert!(!is_eviction(&crate::Error::Cmaf(crate::container::fmp4::Error::NoMoof)));
 	}
 
@@ -1587,17 +1591,27 @@ mod tests {
 		let mut consumer = Consumer::new(consumer_track, Container::Legacy).with_latency(Duration::from_millis(100));
 		let mut group = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
 		for timestamp in [0, 33_000, 66_000] {
-			Container::Legacy.write(&mut group, &[Frame {
-				timestamp: ts(timestamp), payload: Bytes::from_static(&[0xDE, 0xAD]),
-				keyframe: false, duration: None,
-			}]).unwrap();
+			Container::Legacy
+				.write(
+					&mut group,
+					&[Frame {
+						timestamp: ts(timestamp),
+						payload: Bytes::from_static(&[0xDE, 0xAD]),
+						keyframe: false,
+						duration: None,
+					}],
+				)
+				.unwrap();
 		}
 		group.finish().unwrap();
 		assert_eq!(consumer.read().await.unwrap().unwrap().timestamp, ts(0));
 		write_group(&mut track, 5, &[ts(150_000)]);
 		group.abort(moq_net::Error::Old).unwrap();
-		let next = tokio::time::timeout(Duration::from_secs(1), consumer.read()).await
-			.expect("finished, evicted group blocked the live reader").unwrap().unwrap();
+		let next = tokio::time::timeout(Duration::from_secs(1), consumer.read())
+			.await
+			.expect("finished, evicted group blocked the live reader")
+			.unwrap()
+			.unwrap();
 		assert_eq!(next.timestamp, ts(150_000));
 	}
 
@@ -2527,5 +2541,104 @@ mod tests {
 		assert_eq!(frames[1].timestamp, ts(20_000));
 		assert_eq!(frames[2].timestamp, ts(33_000));
 		finisher.await.unwrap();
+	}
+}
+
+#[cfg(test)]
+mod lab_cold_subscription {
+	use super::Container as ContainerTrait;
+	use super::*;
+	use crate::catalog::hang::Container;
+	use bytes::Bytes;
+	use std::time::Duration;
+
+	fn ts(us: u64) -> Timestamp {
+		Timestamp::from_micros(us).unwrap()
+	}
+	fn writer() -> moq_net::track::Producer {
+		moq_net::broadcast::Info::new()
+			.produce()
+			.create_track("video", hang::container::track_info())
+			.unwrap()
+	}
+	fn group(track: &mut moq_net::track::Producer, sequence: u64, us: u64) {
+		let mut g = track.create_group(moq_net::group::Info { sequence }).unwrap();
+		Container::Legacy
+			.write(
+				&mut g,
+				&[Frame {
+					timestamp: ts(us),
+					payload: Bytes::from_static(&[1]),
+					keyframe: true,
+					duration: None,
+				}],
+			)
+			.unwrap();
+		g.finish().unwrap();
+	}
+	fn read(consumer: &mut Consumer<Container>) -> Poll<Result<Option<Frame>, crate::Error>> {
+		consumer.poll_read(&kio::Waiter::noop())
+	}
+	fn timestamp(consumer: &mut Consumer<Container>) -> u64 {
+		match read(consumer) {
+			Poll::Ready(Ok(Some(frame))) => frame.timestamp.as_micros() as u64,
+			other => panic!("expected an available frame, got {other:?}"),
+		}
+	}
+
+	// No stale local content: the first remotely served sequence is adopted.
+	#[tokio::test]
+	async fn no_cache_delivers_first_live_group_immediately() {
+		let mut track = writer();
+		let mut media =
+			Consumer::new(track.subscribe(None), Container::Legacy).with_latency(Duration::from_millis(700));
+		assert!(read(&mut media).is_pending());
+		group(&mut track, 120, 30_000_000);
+		assert_eq!(timestamp(&mut media), 30_000_000);
+	}
+
+	// Reproduces the hypothesis with the actual installed mux implementation:
+	// cached local content anchors startup behind a gap that was never requested
+	// in the new live subscription. Seven hundred milliseconds of new MEDIA,
+	// rather than a wall timer, must accumulate before the first new GOP surfaces.
+	#[tokio::test]
+	async fn stale_cache_adds_a_second_full_media_budget() {
+		tokio::time::pause();
+		let mut track = writer();
+		group(&mut track, 0, 0);
+		tokio::time::advance(Duration::from_secs(30)).await;
+		let mut media =
+			Consumer::new(track.subscribe(None), Container::Legacy).with_latency(Duration::from_millis(700));
+		assert_eq!(timestamp(&mut media), 0);
+		group(&mut track, 120, 30_000_000);
+		assert!(read(&mut media).is_pending(), "fresh group currently remains hidden");
+		for n in 1..7 {
+			group(&mut track, 120 + n, 30_000_000 + n * 100_000);
+			assert!(read(&mut media).is_pending());
+		}
+		group(&mut track, 127, 30_700_000);
+		assert_eq!(timestamp(&mut media), 30_000_000);
+		println!("stale cache: first live frame released only after 700 ms of newer media");
+	}
+
+	// Discriminating alternative: snapshot the old local edge BEFORE registering
+	// fresh demand, floor this new reader beyond it, and preserve live wire demand.
+	// This is a test-only cursor configuration, not an installed production fix.
+	#[tokio::test]
+	async fn fresh_local_cursor_avoids_cache_gap_without_changing_wire_budget() {
+		tokio::time::pause();
+		let mut track = writer();
+		group(&mut track, 0, 0);
+		tokio::time::advance(Duration::from_secs(30)).await;
+		let old_edge = track.consume().latest().unwrap();
+		let mut sub = track.subscribe(None);
+		sub.start_at(old_edge + 1);
+		let mut media = Consumer::new(sub, Container::Legacy).with_latency(Duration::from_millis(700));
+		assert!(read(&mut media).is_pending(), "old content must not anchor startup");
+		group(&mut track, 120, 30_000_000);
+		assert_eq!(timestamp(&mut media), 30_000_000);
+		assert_eq!(media.track.subscription().group_start, None);
+		assert_eq!(media.track.subscription().latency_max, Duration::from_millis(700));
+		println!("fresh local cursor: first live frame released immediately, same wire budget");
 	}
 }
