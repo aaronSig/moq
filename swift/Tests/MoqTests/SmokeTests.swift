@@ -84,6 +84,44 @@ final class SmokeTests: XCTestCase {
         XCTAssertNil(end)
     }
 
+    func testLiveMediaReaderSkipsCachedGroupWithoutMovingExistingReader() async throws {
+        let broadcast = try BroadcastProducer()
+        let track = try broadcast.publishTrack(name: "video")
+        let cached = try track.createGroup(sequence: 0)
+        // Legacy media: one-byte QUIC varint timestamp, then codec payload.
+        try cached.writeFrame(Data([0, 0xaa]), timestampUs: 0)
+        try cached.finish()
+        let consumer = try broadcast.consume()
+        let existing = try await consumer.subscribeMedia(name: "video", container: .legacy)
+        let live = try await consumer.subscribeMediaLive(name: "video", container: .legacy)
+        let fresh = try track.createGroup(sequence: 42)
+        try fresh.writeFrame(Data([42, 0xbb]), timestampUs: 42)
+        try fresh.finish()
+        let oldFrame = try await existing.next()
+        let liveFrame = try await live.next()
+        XCTAssertEqual(oldFrame?.payload, Data([0xaa]))
+        XCTAssertEqual(liveFrame?.payload, Data([0xbb]))
+        existing.cancel()
+        live.cancel()
+        try track.finish()
+        try broadcast.finish()
+    }
+
+    func testLiveMediaReaderHonorsAnExplicitCachedRange() async throws {
+        let broadcast = try BroadcastProducer()
+        let track = try broadcast.publishTrack(name: "video")
+        let cached = try track.createGroup(sequence: 0)
+        try cached.writeFrame(Data([0, 0xaa]), timestampUs: 0)
+        try cached.finish()
+        let live = try await broadcast.consume().subscribeMediaLive(
+            name: "video", container: .legacy, subscription: Subscription(groupStart: 0))
+        let frame = try await live.next()
+        XCTAssertEqual(frame?.payload, Data([0xaa]))
+        live.cancel()
+        try track.finish()
+        try broadcast.finish()
+    }
+
     func testJsonSnapshotRoundTrip() async throws {
         struct Status: Codable, Equatable {
             let state: String
