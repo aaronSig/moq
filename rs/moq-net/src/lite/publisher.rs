@@ -2148,10 +2148,25 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 			return Err(err);
 		}
 
-		// Consume the writer: close() waits for the peer to acknowledge everything,
-		// and taking ownership disarms the Drop fallback that would otherwise reset
-		// the finished stream with a spurious Cancel.
-		stream.close().await?;
+		// FIN is still queued data: keep both rank updates and cancellation live
+		// until acknowledgement. Clean completion disarms the reset-on-drop guard.
+		self.apply_priority(&mut stream, &mut priority);
+		stream
+			.close_with_priority(|waiter| {
+				let seen = self.track_priority_seen;
+				if let Poll::Ready(Ok(value)) = self.track_priority.poll(waiter, |value| {
+					if **value != seen {
+						Poll::Ready(**value)
+					} else {
+						Poll::Pending
+					}
+				}) {
+					self.track_priority_seen = value;
+					priority.set_track(value);
+				}
+				priority.poll_next(waiter).map(|_| priority.send_order())
+			})
+			.await?;
 
 		tracing::debug!(sequence, "finished group");
 

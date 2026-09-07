@@ -91,15 +91,44 @@ impl<S: web_transport_trait::SendStream, V> Writer<S, V> {
 	/// Keep the Drop fallback armed while awaiting acknowledgement: cancelling an
 	/// obsolete subscription must still reset its queued reliable bytes. Only a
 	/// successful acknowledgement disarms it, so normal completion never resets.
-	pub async fn close(mut self) -> Result<(), Error> {
+	pub async fn close(self) -> Result<(), Error> {
+		self.close_with_priority(|_| std::task::Poll::Pending).await
+	}
+
+	/// Keep queued reliable bytes correctly ranked until their FIN is acknowledged.
+	pub(crate) async fn close_with_priority(
+		mut self,
+		mut priority: impl FnMut(&kio::Waiter) -> std::task::Poll<u8>,
+	) -> Result<(), Error> {
+		use std::task::Poll;
 		let Some(stream) = self.stream.as_mut() else {
 			return Ok(());
 		};
-
 		stream.finish().map_err(Error::from_transport)?;
-		stream.closed().await.map_err(Error::from_transport)?;
+		enum Event<E> {
+			Closed(Result<(), E>),
+			Priority(u8),
+		}
+		loop {
+			let event = {
+				let mut closed = std::pin::pin!(stream.closed());
+				kio::wait(|waiter| {
+					if let Poll::Ready(value) = priority(waiter) {
+						return Poll::Ready(Event::Priority(value));
+					}
+					waiter.poll_future(closed.as_mut()).map(Event::Closed)
+				})
+				.await
+			};
+			match event {
+				Event::Closed(result) => {
+					result.map_err(Error::from_transport)?;
+					break;
+				}
+				Event::Priority(value) => stream.set_priority(value),
+			}
+		}
 		self.stream.take();
-
 		Ok(())
 	}
 
@@ -233,6 +262,56 @@ mod tests {
 		close.await.unwrap();
 		assert!(log.resets().is_empty());
 		assert_eq!(*log.writes.lock().unwrap(), b"complete video");
+	}
+
+	#[tokio::test]
+	async fn priority_changes_during_fin_ack_wait() {
+		use std::task::Poll;
+		let log = Log::default();
+		let ack = kio::Producer::new(false);
+		let priorities = kio::Producer::new(255u8);
+		let rx = priorities.consume();
+		let mut seen = 255;
+		let send = AckGatedSend {
+			inner: SinkSend::new(log.clone()),
+			ack: ack.consume(),
+		};
+		let mut writer = Writer::new(send, crate::lite::Version::Lite05);
+		writer
+			.write_chunk(bytes::Bytes::from_static(b"queued video"))
+			.await
+			.unwrap();
+		writer.set_priority(255);
+		let mut close = Box::pin(writer.close_with_priority(|waiter| {
+			match rx.poll(waiter, |value| {
+				if **value != seen {
+					Poll::Ready(**value)
+				} else {
+					Poll::Pending
+				}
+			}) {
+				Poll::Ready(Ok(value)) => {
+					seen = value;
+					Poll::Ready(value)
+				}
+				_ => Poll::Pending,
+			}
+		}));
+		assert!(futures::poll!(close.as_mut()).is_pending());
+		*priorities.write().ok().unwrap() = 254;
+		assert!(futures::poll!(close.as_mut()).is_pending());
+		assert_eq!(
+			log.priorities().last(),
+			Some(&254),
+			"FIN wait kept an obsolete priority"
+		);
+		*priorities.write().ok().unwrap() = 253;
+		assert!(futures::poll!(close.as_mut()).is_pending());
+		assert_eq!(log.priorities().last(), Some(&253));
+		*ack.write().ok().unwrap() = true;
+		close.await.unwrap();
+		assert!(log.resets().is_empty());
+		assert_eq!(*log.writes.lock().unwrap(), b"queued video");
 	}
 
 	#[test]
