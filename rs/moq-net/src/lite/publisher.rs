@@ -2167,9 +2167,10 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		priority: &mut PriorityHandle,
 		group: &mut group::Consumer,
 	) -> Result<(), Error> {
-		stream.set_priority(priority.send_order());
-		stream.encode(&lite::DataType::Group).await?;
-		stream.encode(msg).await?;
+		let mut header = bytes::BytesMut::new();
+		lite::DataType::Group.encode(&mut header, self.version)?;
+		msg.encode(&mut header, self.version)?;
+		self.write_chunk(stream, priority, header.freeze()).await?;
 
 		// Lite05+ delta-encodes per-frame timestamps within the group. The first
 		// frame's delta is absolute (against an implicit prev value of 0), every
@@ -2239,9 +2240,8 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		mut frame: frame::Consumer,
 		prev_ts: &mut u64,
 	) -> Result<(), Error> {
-		encode_frame_timing(stream, frame.timestamp, self.timescale, prev_ts).await?;
-
-		stream.encode(&frame.size).await?;
+		self.write_frame_header(stream, priority, frame.timestamp, frame.size, prev_ts)
+			.await?;
 
 		while let Some(chunk) = self.read_chunk(stream, priority, &mut frame).await? {
 			self.write_chunk(stream, priority, chunk).await?;
@@ -2288,10 +2288,34 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		frame: frame::Frame,
 		prev_ts: &mut u64,
 	) -> Result<(), Error> {
-		encode_frame_timing(stream, frame.timestamp, self.timescale, prev_ts).await?;
-		stream.encode(&(frame.payload.len() as u64)).await?;
+		self.write_frame_header(stream, priority, frame.timestamp, frame.payload.len() as u64, prev_ts)
+			.await?;
 		if !frame.payload.is_empty() {
 			self.write_chunk(stream, priority, frame.payload).await?;
+		}
+		Ok(())
+	}
+
+	async fn write_frame_header(
+		&mut self,
+		stream: &mut Writer<S::SendStream, Version>,
+		priority: &mut PriorityHandle,
+		timestamp: crate::Timestamp,
+		size: u64,
+		prev_ts: &mut u64,
+	) -> Result<(), Error> {
+		let mut header = bytes::BytesMut::new();
+		if self.timescale.is_some() {
+			let delta: i64 = (timestamp.value() as i128 - *prev_ts as i128)
+				.try_into()
+				.map_err(|_| Error::BoundsExceeded(crate::coding::BoundsExceeded))?;
+			let zz = crate::coding::VarInt::from_zigzag(delta).map_err(crate::coding::EncodeError::from)?;
+			zz.encode(&mut header, self.version)?;
+		}
+		size.encode(&mut header, self.version)?;
+		self.write_chunk(stream, priority, header.freeze()).await?;
+		if self.timescale.is_some() {
+			*prev_ts = timestamp.value();
 		}
 		Ok(())
 	}
@@ -2383,10 +2407,49 @@ impl<S: web_transport_trait::Session> Subscription<S> {
 		&mut self,
 		stream: &mut Writer<S::SendStream, Version>,
 		priority: &mut PriorityHandle,
-		chunk: bytes::Bytes,
+		mut chunk: bytes::Bytes,
 	) -> Result<(), Error> {
-		self.apply_priority(stream, priority);
-		stream.write_chunk(chunk).await
+		// Keep the remaining bytes outside the raced future. write_buf is cancel
+		// safe; write_chunk takes ownership and could lose an unwritten suffix.
+		while !chunk.is_empty() {
+			self.apply_priority(stream, priority);
+			enum Event {
+				Written(Result<usize, Error>),
+				Rank,
+				Track(u8),
+			}
+			let event = {
+				let mut write = std::pin::pin!(stream.write(&mut chunk));
+				let seen = self.track_priority_seen;
+				kio::wait(|waiter| {
+					if priority.poll_next(waiter).is_ready() {
+						return Poll::Ready(Event::Rank);
+					}
+					if let Poll::Ready(Ok(value)) = self.track_priority.poll(waiter, |value| {
+						if **value != seen {
+							Poll::Ready(**value)
+						} else {
+							Poll::Pending
+						}
+					}) {
+						return Poll::Ready(Event::Track(value));
+					}
+					waiter.poll_future(write.as_mut()).map(Event::Written)
+				})
+				.await
+			};
+			match event {
+				Event::Written(result) => {
+					result?;
+				}
+				Event::Rank => {}
+				Event::Track(value) => {
+					self.track_priority_seen = value;
+					priority.set_track(value);
+				}
+			}
+		}
+		Ok(())
 	}
 
 	fn apply_priority(&mut self, stream: &mut Writer<S::SendStream, Version>, priority: &mut PriorityHandle) {
