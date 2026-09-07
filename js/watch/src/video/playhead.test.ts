@@ -38,12 +38,14 @@ describe("caughtUp", () => {
 		expect(caughtUp({ playhead: ms(9800), active: ms(10_000) })).toBe(false);
 	});
 
-	it("promotes once the new rendition is within slack of it", () => {
-		expect(caughtUp({ playhead: ms(9900), active: ms(10_000) })).toBe(true);
+	it("promotes once the new rendition reaches the outgoing picture", () => {
+		expect(caughtUp({ playhead: ms(9900), active: ms(10_000) })).toBe(false);
+		expect(caughtUp({ playhead: ms(9999), active: ms(10_000) })).toBe(false);
+		expect(caughtUp({ playhead: ms(10_000), active: ms(10_000) })).toBe(true);
 		expect(caughtUp({ playhead: ms(10_500), active: ms(10_000) })).toBe(true);
 	});
 
-	it("never lets a switch replay more than the slack", () => {
+	it("never lets a switch replay the old picture", () => {
 		// Selecting a coarser rendition grows the sync buffer, which drops the live edge below the
 		// outgoing playhead. Promoting at the live edge would replay everything in between, so the
 		// bar stays the outgoing playhead however far live falls behind it.
