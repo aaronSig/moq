@@ -1,6 +1,6 @@
 use std::{
 	collections::{HashMap, VecDeque},
-	sync::{Arc, Mutex, OnceLock},
+	sync::{Arc, Mutex, Weak},
 	task::Poll,
 };
 
@@ -115,19 +115,19 @@ pub struct VirtualRecvStream {
 	buffer: Bytes,
 	rx: Queue<Bytes>,
 	closed: bool,
-	shared: Arc<Shared>,
+	shared: Weak<Shared>,
 	/// The request this stream serves, known up front when the peer opened it and
 	/// filled in by the first write when we did.
-	request_id: Arc<OnceLock<RequestId>>,
+	request_id: Arc<Mutex<Option<RequestId>>>,
 }
 
 impl VirtualRecvStream {
-	fn new(initial: Bytes, rx: Queue<Bytes>, shared: Arc<Shared>, request_id: Arc<OnceLock<RequestId>>) -> Self {
+	fn new(initial: Bytes, rx: Queue<Bytes>, shared: Arc<Shared>, request_id: Arc<Mutex<Option<RequestId>>>) -> Self {
 		Self {
 			buffer: initial,
 			rx,
 			closed: false,
-			shared,
+			shared: Arc::downgrade(&shared),
 			request_id,
 		}
 	}
@@ -215,8 +215,10 @@ impl Drop for VirtualRecvStream {
 
 		// Release the routing entries too, so a request torn down locally gives its
 		// namespace back and the same one can be advertised again.
-		if let Some(request_id) = self.request_id.get() {
-			self.shared.forget(*request_id);
+		if let Some(request_id) = *self.request_id.lock().unwrap()
+			&& let Some(shared) = self.shared.upgrade()
+		{
+			shared.forget(request_id);
 		}
 	}
 }
@@ -241,7 +243,7 @@ struct OutgoingRegistration {
 	buf: BytesMut,
 	/// Shared with the matching [`VirtualRecvStream`] so it can release this request's
 	/// routing entries once the reader is dropped.
-	request_id: Arc<OnceLock<RequestId>>,
+	request_id: Arc<Mutex<Option<RequestId>>>,
 }
 
 impl OutgoingRegistration {
@@ -281,8 +283,16 @@ impl OutgoingRegistration {
 	}
 
 	fn register(self, request_id: RequestId) {
-		let _ = self.request_id.set(request_id);
-		self.shared.streams.lock().unwrap().insert(request_id, self.follow_tx);
+		// Serialize publication with receive-half cleanup, including a drop before
+		// the first write supplied the request id.
+		let mut registered = self.request_id.lock().unwrap();
+		*registered = Some(request_id);
+		let closed = self.follow_tx.0.0.lock().closed;
+		if closed {
+			self.shared.forget(request_id);
+		} else {
+			self.shared.streams.lock().unwrap().insert(request_id, self.follow_tx);
+		}
 	}
 }
 
@@ -570,7 +580,7 @@ impl Shared {
 	/// until the first write reveals the request_id.
 	fn open_outgoing(self: &Arc<Self>, version: Version) -> (VirtualSendStream, VirtualRecvStream) {
 		let follow = Queue::new();
-		let request_id = Arc::new(OnceLock::new());
+		let request_id = Arc::new(Mutex::new(None));
 		let recv = VirtualRecvStream::new(Bytes::new(), follow.clone(), Arc::clone(self), Arc::clone(&request_id));
 		let send = VirtualSendStream::with_registration(
 			self.control.clone(),
@@ -588,7 +598,12 @@ impl Shared {
 	/// Register the peer's new request and queue its stream for accept_bi.
 	fn open_incoming(self: &Arc<Self>, request_id: RequestId, raw: Bytes) -> Result<(), Error> {
 		let follow = Queue::new();
-		let recv = VirtualRecvStream::new(raw, follow.clone(), Arc::clone(self), Arc::new(request_id.into()));
+		let recv = VirtualRecvStream::new(
+			raw,
+			follow.clone(),
+			Arc::clone(self),
+			Arc::new(Mutex::new(Some(request_id))),
+		);
 		let send = VirtualSendStream::new(self.control.clone());
 		self.streams.lock().unwrap().insert(request_id, follow.writer());
 		if !self.incoming.push((send, recv)) {
@@ -920,11 +935,7 @@ fn lookup_namespace_request_id(
 ) -> Result<Option<RequestId>, Error> {
 	let mut cursor = std::io::Cursor::new(body);
 	let ns = crate::ietf::namespace::decode_namespace(&mut cursor, version)?;
-	let request_id = namespaces.get(direction, &ns);
-	if request_id.is_none() {
-		tracing::warn!(namespace = %ns, ?direction, "no advertisement to withdraw");
-	}
-	Ok(request_id)
+	Ok(namespaces.get(direction, &ns))
 }
 
 impl<S: web_transport_trait::Session> web_transport_trait::Session for ControlStreamAdapter<S> {
@@ -1075,7 +1086,7 @@ mod tests {
 
 	/// A receive stream with no request behind it, for exercising the reader alone.
 	fn detached_recv(initial: Bytes, rx: Queue<Bytes>) -> VirtualRecvStream {
-		VirtualRecvStream::new(initial, rx, Arc::new(Shared::default()), Arc::new(OnceLock::new()))
+		VirtualRecvStream::new(initial, rx, Arc::new(Shared::default()), Arc::new(Mutex::new(None)))
 	}
 
 	#[test]
@@ -1524,6 +1535,34 @@ mod tests {
 			cancel(&shared, "cluster/ns", version),
 			Route::CloseStream(RequestId(6))
 		));
+	}
+
+	#[test]
+	fn queued_incoming_stream_does_not_keep_shared_alive() {
+		let shared = Arc::new(Shared::default());
+		let weak = Arc::downgrade(&shared);
+		shared.open_incoming(RequestId(7), Bytes::new()).unwrap();
+		drop(shared);
+		assert!(weak.upgrade().is_none());
+	}
+
+	#[tokio::test]
+	async fn receive_drop_before_registration_releases_namespace() {
+		for version in [Version::Draft14, Version::Draft15] {
+			let shared = Arc::new(Shared::default());
+			let (mut send, recv) = shared.open_outgoing(version);
+			drop(recv);
+			send.write_chunk(encode_msg(&publish_namespace(RequestId(4), "cluster/ns"), version))
+				.await
+				.unwrap();
+			assert!(shared.streams.lock().unwrap().is_empty());
+			assert!(matches!(cancel(&shared, "cluster/ns", version), Route::Ignore));
+			let _again = advertise(&shared, "cluster/ns", version, RequestId(6)).await;
+			assert!(matches!(
+				cancel(&shared, "cluster/ns", version),
+				Route::CloseStream(RequestId(6))
+			));
+		}
 	}
 
 	#[test]

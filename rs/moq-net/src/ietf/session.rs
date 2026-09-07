@@ -1038,7 +1038,7 @@ mod tests {
 	///
 	/// Driven through `start` because only the full loop shows the consequence, the read
 	/// task propagating the classifier's error.
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn a_repeated_publish_namespace_done_does_not_end_the_session() {
 		const VERSION: Version = Version::Draft14;
 
