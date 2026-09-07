@@ -341,7 +341,7 @@ impl<E: CatalogExt> Producer<E> {
 		let (format, channels) = (input.format, input.channels);
 		let pcm = format.as_interleaved_f32(frame.data.as_ref(), channels)?;
 		let pcm: Vec<f32> = match self.resampler.as_mut() {
-			Some(r) => r.process(&pcm)?,
+			Some(r) => r.process(&pcm, frame.timestamp)?,
 			None => pcm.into_owned(),
 		};
 

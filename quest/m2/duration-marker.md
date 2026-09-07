@@ -58,5 +58,4 @@ caller passes `cut(Some(end))`.
 - [Gap discontinuity](/quest/m1/gap-discontinuity.md) - the reset signal, which this marker is not
 - [Monotonic timeline](/quest/m1/monotonic-timeline.md) - the forward-only rule the boundary sits under
 - [Timeline](/quest/m1/archive/timeline.md) - the archive index that wants honest final durations
-- [#3326](/quest/m0/3326-moq-audio-held-resampler-frames-keep-their-source-timestamp.md) - covers the terminal phase this quest removes
 - [LOC duration marker](/quest/m2/loc-duration-marker.md) - the LOC producer half, gated on a release

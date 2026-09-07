@@ -23,9 +23,6 @@ pub struct Consumer {
 	latency_max: std::time::Duration,
 	resolved_sample_rate: u32,
 	resolved_channels: u32,
-	/// One past the last sample handed to the resampler, so the tail it is still
-	/// holding at end of track can be stamped. `None` until the first packet.
-	tail: Option<moq_net::Timestamp>,
 	/// Where the next packet's timestamp should land: the last packet's timestamp
 	/// plus the media it covered, including the codec delay the decoder trimmed off
 	/// the front. A packet that misses it is a hole nobody declared.
@@ -107,7 +104,6 @@ impl Consumer {
 			latency_max,
 			resolved_sample_rate: sample_rate,
 			resolved_channels: channels,
-			tail: None,
 			next_start: None,
 			ready: VecDeque::new(),
 			spans: VecDeque::new(),
@@ -232,19 +228,20 @@ impl Consumer {
 			let (pcm, timestamp) = match self.resampler.as_mut() {
 				// The resampler works in fixed chunks, so it holds back whatever didn't
 				// fill one. What comes out next starts with those held-back samples, which
-				// arrived before this packet did: stamping it with this packet's timestamp
-				// would place the audio late by up to a chunk, sawtoothing A/V sync.
+				// arrived before this packet did, so it is stamped where they arrived.
+				// Reading that off this packet instead would place the audio late by up to
+				// a chunk, sawtoothing A/V sync, and drag it the whole way whenever the
+				// source jumps forward without declaring a hole.
 				Some(r) => {
-					let pending = r.pending_frames();
+					let held = r.held_at().unwrap_or(decoded_at);
 					let skipped = r.skipped();
-					let pcm = r.process(&decoded)?;
-					(pcm, self.starts_at(decoded_at, pending, skipped, rate)?)
+					let pcm = r.process(&decoded, decoded_at)?;
+					(pcm, rewind(held, skipped, self.resolved_sample_rate)?)
 				}
 				None => (decoded, decoded_at),
 			};
 
 			let decoded_end = advance(decoded_at, frames, rate)?;
-			self.tail = Some(decoded_end);
 
 			// The resampler hands back samples it was holding from earlier packets,
 			// so what comes out starts before the packet that filled its chunk. Track
@@ -289,7 +286,6 @@ impl Consumer {
 		if let Some(resampler) = self.resampler.as_mut() {
 			resampler.reset();
 		}
-		self.tail = None;
 		self.next_start = None;
 		self.spans.clear();
 		self.trailing = Activity::Active;
@@ -312,26 +308,14 @@ impl Consumer {
 	fn gap(&mut self) -> Result<Option<Frame>, Error> {
 		self.decoder.reset_prediction()?;
 
-		let drained = match (self.resampler.as_mut(), self.tail) {
-			(Some(resampler), Some(tail)) => {
-				let pending = resampler.pending_frames();
-				let skipped = resampler.skipped();
-				let pcm = resampler.drain()?;
-				(!pcm.is_empty()).then_some((pcm, tail, pending, skipped))
-			}
-			_ => None,
-		};
+		let mut frame = None;
+		if let Some(resampler) = self.resampler.as_mut() {
+			let held = resampler.held_at();
+			let skipped = resampler.skipped();
+			let pcm = resampler.drain()?;
+			frame = self.tail(pcm, held, skipped)?;
+		}
 
-		let frame = match drained {
-			Some((pcm, tail, pending, skipped)) => {
-				let timestamp = self.starts_at(tail, pending, skipped, self.decoder.sample_rate())?;
-				let activity = self.activity_at(timestamp);
-				Some(self.frame(pcm, timestamp, activity)?)
-			}
-			None => None,
-		};
-
-		self.tail = None;
 		self.next_start = None;
 		self.spans.clear();
 		self.trailing = Activity::Active;
@@ -347,18 +331,31 @@ impl Consumer {
 	/// resampler, which is what makes calling this on every later poll return
 	/// `None` rather than more tails.
 	fn flush(&mut self) -> Result<Option<Frame>, Error> {
-		let (Some(resampler), Some(tail)) = (self.resampler.take(), self.tail) else {
+		let Some(resampler) = self.resampler.take() else {
 			return Ok(None);
 		};
 
-		let pending = resampler.pending_frames();
+		let held = resampler.held_at();
 		let skipped = resampler.skipped();
-		let pcm = resampler.flush()?;
-		if pcm.is_empty() {
-			return Ok(None);
-		}
+		self.tail(resampler.flush()?, held, skipped)
+	}
 
-		let timestamp = self.starts_at(tail, pending, skipped, self.decoder.sample_rate())?;
+	/// Stamp and pack a tail the resampler handed back, if it handed back one.
+	///
+	/// `held` is where the samples it was holding arrived, which is where the tail
+	/// begins once the startup frames it dropped of its own are taken off. `None`
+	/// there means the resampler never ran, so there is nothing to place.
+	fn tail(
+		&mut self,
+		pcm: Vec<f32>,
+		held: Option<moq_net::Timestamp>,
+		skipped: usize,
+	) -> Result<Option<Frame>, Error> {
+		let Some(held) = held.filter(|_| !pcm.is_empty()) else {
+			return Ok(None);
+		};
+
+		let timestamp = rewind(held, skipped, self.resolved_sample_rate)?;
 		let activity = self.activity_at(timestamp);
 		Ok(Some(self.frame(pcm, timestamp, activity)?))
 	}
@@ -371,25 +368,6 @@ impl Consumer {
 		}
 
 		self.spans.front().map_or(self.trailing, |span| span.activity)
-	}
-
-	/// Where the output the resampler is about to hand back actually begins.
-	///
-	/// Two things sit between a packet's timestamp and the audio that comes out of
-	/// it. The resampler is holding `pending` input frames from before this packet,
-	/// which the output starts with. And it has dropped `skipped` output frames of
-	/// its own startup silence, so everything it emits from then on runs that much
-	/// short of the input it was built from. Reach back over both, each in its own
-	/// rate, or the output is stamped after the audio it contains.
-	fn starts_at(
-		&self,
-		timestamp: moq_net::Timestamp,
-		pending: usize,
-		skipped: usize,
-		rate: u32,
-	) -> Result<moq_net::Timestamp, Error> {
-		let timestamp = rewind(timestamp, pending, rate)?;
-		rewind(timestamp, skipped, self.resolved_sample_rate)
 	}
 
 	/// Remix and pack decoded PCM into an output frame.
@@ -792,6 +770,106 @@ mod tests {
 		let ends_at = read[1].0 + (read[1].1 as u128) * 1_000_000 / 48_000;
 		let hole = read[2].0 - ends_at;
 		assert!((23_100..=23_350).contains(&hole), "unexpected hole: {hole} us");
+	}
+
+	/// A packet can land a hair past where the last one ended without being a hole:
+	/// the stamps are quantized, so `discontinuous` allows a millisecond of slack.
+	/// The jump is still a jump, and the resampler is holding samples from before
+	/// it. Deriving their stamp by counting back from the packet drags them forward
+	/// by the whole jump; reading it off the packet they arrived with does not.
+	#[tokio::test]
+	async fn a_jump_inside_the_slack_leaves_the_held_samples_alone() {
+		// 441 frames at 44.1 kHz is 10 ms, half of the 20 ms chunk, so the first
+		// packet is held whole and the second is what completes the chunk.
+		const FRAMES: usize = 441;
+		// A millisecond past where the first packet ended, which is the slack the
+		// legacy container's microsecond re-stamping is allowed.
+		let stamps = [
+			Timestamp::from_micros(0).unwrap(),
+			Timestamp::from_micros(11_000).unwrap(),
+		];
+		let read = pcm_gaps(44_100, 48_000, FRAMES, &stamps).await;
+
+		// The chunk, then the flush at the end of the track: no hole was declared, so
+		// nothing was drained in between.
+		assert_eq!(read.len(), 2, "unexpected frames: {read:?}");
+		// It starts with the first packet's samples, so it is stamped where that
+		// packet was. Rewinding from the second one instead puts it a millisecond late.
+		assert_eq!(read[0].0, 0, "held samples moved with the jump: {read:?}");
+	}
+
+	/// Once an end marker arrives the gap check stops running, because from there
+	/// each batch's time is reconstructed from the marker rather than read off the
+	/// packet. A packet that jumps forward then still moves whatever the resampler
+	/// is holding, and the activity that lands with it: those samples came from
+	/// before the jump and are labelled by the packet they came from.
+	#[tokio::test]
+	async fn a_terminal_jump_leaves_the_held_samples_alone() {
+		let mut encoder = Encoder::new(&crate::encode::Config {
+			dtx: true,
+			bitrate: Some(24_000),
+			..crate::encode::Config::new(Input {
+				channels: 1,
+				..Input::default()
+			})
+		})
+		.unwrap();
+		let catalog = encoder.catalog();
+
+		// One coded packet, then a withheld one to follow it. Taken from the same
+		// encoder rather than published in between, so nothing fills the resampler's
+		// chunk between the two.
+		let active = encoder.encode(&vec![0.5f32; encoder.frame_size()]).unwrap();
+		assert!(active.activity.is_active());
+		let silence = vec![0.0f32; encoder.frame_size()];
+		let dtx = (0..200)
+			.map(|_| encoder.encode(&silence).unwrap())
+			.find(|packet| packet.activity.is_dtx())
+			.expect("silence should enter Opus DTX");
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast.create_track("audio", hang::container::track_info()).unwrap();
+		let subscriber = broadcast.consume();
+		let mut producer = moq_mux::container::Producer::new(track, moq_mux::catalog::hang::Container::Legacy);
+		let mut consumer = Consumer::new(
+			&subscriber,
+			&catalog,
+			"audio",
+			Config {
+				sample_rate: Some(44_100),
+				..Config::new()
+			},
+		)
+		.await
+		.unwrap();
+
+		// A 20 ms Opus packet decodes 960 frames, less the pre-skip on the first one,
+		// so it doesn't fill the 960-frame chunk and is held whole.
+		let write = |producer: &mut moq_mux::container::Producer<_>, frames: u64, payload: Bytes| {
+			producer
+				.write(moq_mux::container::Frame {
+					timestamp: Timestamp::from_scale(frames, 48_000).unwrap(),
+					duration: None,
+					payload,
+					keyframe: true,
+				})
+				.unwrap();
+		};
+		write(&mut producer, 0, active.payload);
+		// The end marker, then the terminal packet a second past where it belongs.
+		write(&mut producer, 3 * 48_000, Bytes::new());
+		write(&mut producer, 48_000, dtx.payload);
+		producer.finish().unwrap();
+
+		let frame = consumer.read().await.unwrap().expect("decoded frame");
+		// The output begins with the first packet's samples, so it is stamped and
+		// labelled from that packet. Rewinding from the terminal one instead drops it
+		// most of a second into the future, carrying the DTX label with it.
+		assert_eq!(frame.timestamp.as_micros(), 0, "held samples moved with the jump");
+		assert!(
+			frame.activity.is_active(),
+			"held samples took the terminal packet's label"
+		);
 	}
 
 	/// Every packet on the RTMP path lands beside where the last one ended: FLV

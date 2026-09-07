@@ -944,7 +944,7 @@ impl Converter {
 		}
 
 		if let Some(resampler) = self.resampler.as_mut() {
-			let data = resampler.process(&samples.data)?;
+			let data = resampler.process(&samples.data, moq_net::Timestamp::from_micros(timestamp_us)?)?;
 			samples.replace(data);
 		}
 		if self.input.channels != self.output.channels {
