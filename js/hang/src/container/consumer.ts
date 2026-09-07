@@ -18,6 +18,7 @@ interface Group {
 	consumer: Moq.Group.Consumer;
 	frames: Frame[]; // decode order
 	empty: boolean; // no wire frame was published, which declares a discontinuity
+	start?: Time.Micro; // First decoded timestamp, retained after delivery for epoch classification
 	latest?: Time.Micro; // The timestamp of the latest known frame
 	end?: Time.Micro; // The furthest presentation point so far, i.e. max(timestamp + duration)
 	done?: boolean; // Set when #runGroup finishes reading all frames
@@ -231,6 +232,7 @@ export class Consumer {
 
 					if (!marker) index++;
 
+					group.start ??= frame.timestamp;
 					group.frames.push(frame);
 
 					if (group.latest === undefined || frame.timestamp > group.latest) {
@@ -244,15 +246,19 @@ export class Consumer {
 
 					this.#updateBuffered();
 
+					// Resolve the group against an active reset (dropping a reneged straggler),
+					// else detect a new rewind. Both run for the active sequence too: the cursor
+					// advances past a finished group before its successor arrives, so the group
+					// that rewinds is routinely the active one.
+					if (this.#classifyStale(group)) return;
+					this.#checkReset(group);
+
 					let skipped = false;
 					if (group.consumer.sequence !== this.#active) {
-						// A non-active group: resolve it against an active reset (dropping a
-						// reneged straggler), else detect a new rewind, then check latency. This
-						// runs even when the group is the delivery head, because that is exactly
-						// the stalled case (#active sits below every buffered group) where the
-						// latency budget is what eventually breaks the stall.
-						if (this.#classifyStale(group)) return;
-						this.#checkReset(group);
+						// A non-active group can also be too slow to wait for. This runs even when
+						// the group is the delivery head, because that is exactly the stalled case
+						// (#active sits below every buffered group) where the latency budget is
+						// what eventually breaks the stall.
 						this.#checkLatency();
 
 						// A newer group reaching back to where the stalled active group has
@@ -421,10 +427,14 @@ export class Consumer {
 		const live = this.#rewind.liveEdge;
 		if (live === undefined) return;
 
-		// Only a group newer than the active one can rewind the timeline.
-		if (group.consumer.sequence <= this.#active) return;
+		// Only a group newer than the one that supplied the live edge can rewind the timeline.
+		// The cursor is not the bound: it advances past a finished group before the successor
+		// arrives, so a rewind at the cursor is the common case rather than an impossible one.
+		// Ruling out the live edge's own group is what keeps B-frame reordering inside it
+		// continuous, and it matches the prevMax the Reset below is built from.
+		if (group.consumer.sequence <= live.group) return;
 
-		const start = group.frames.at(0)?.timestamp;
+		const start = group.start;
 		if (start === undefined) return;
 
 		// A rewind is the timestamp going strictly backwards past the live edge. Anything at
@@ -439,8 +449,8 @@ export class Consumer {
 		// Drop buffered groups the boundary can already prove stale; keep ambiguous ones.
 		this.#groups = this.#groups.filter((g) => {
 			const verdict = reset.bySequence(g.consumer.sequence);
-			const first = g.frames.at(0);
-			const stale = verdict ?? (first !== undefined && reset.isStale(g.consumer.sequence, first.timestamp));
+			const start = g.start;
+			const stale = verdict ?? (start !== undefined && reset.isStale(g.consumer.sequence, start));
 			if (stale) {
 				g.consumer.close();
 				g.frames.length = 0;
@@ -477,14 +487,27 @@ export class Consumer {
 		const reset = this.#rewind.boundary;
 		if (!reset) return false;
 
-		const first = group.frames.at(0);
-		if (first === undefined) return false;
-		if (!reset.isStale(group.consumer.sequence, first.timestamp)) return false;
+		const start = group.start;
+		if (start === undefined) return false;
+		if (!reset.isStale(group.consumer.sequence, start)) return false;
 
 		this.#groups = this.#groups.filter((g) => g !== group);
 		group.consumer.close();
 		group.frames.length = 0;
 		this.#gap = true;
+
+		// A reset resumes from the earliest survivor, which may still be ambiguous, so the cursor
+		// can be sitting on the group just dropped. Move it here rather than leaving #runGroup's
+		// finally block to do it: that path would call #recordPresented and adopt this group's
+		// old-epoch end as the presented timeline, which is exactly the stale value the reset
+		// cleared. Survivors below still deliver first, since delivery only needs the head at or
+		// below the cursor.
+		if (group.consumer.sequence === this.#active) {
+			this.#active =
+				this.#groups.find((g) => g.consumer.sequence > group.consumer.sequence)?.consumer.sequence ??
+				group.consumer.sequence + 1;
+		}
+
 		this.#updateBuffered();
 		return true;
 	}
@@ -495,9 +518,10 @@ export class Consumer {
 	// rewind would be missed. Highest sequence first, mirroring the Rust scan: the first rewound
 	// group becomes the boundary, and #checkReset's own guards make the rest no-ops.
 	#checkBufferedReset(): void {
-		if (this.#active === undefined || this.#rewind.liveEdge === undefined) return;
+		const live = this.#rewind.liveEdge;
+		if (this.#active === undefined || live === undefined) return;
 		for (const group of [...this.#groups].reverse()) {
-			if (group.consumer.sequence <= this.#active) break;
+			if (group.consumer.sequence <= live.group) break;
 			this.#checkReset(group);
 		}
 	}

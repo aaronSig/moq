@@ -463,6 +463,159 @@ test("Consumer delivers a rewound endpoint before its terminal packet", async ()
 	consumer.close();
 });
 
+// --- Rewinds at the playback cursor ---
+
+/** Read until the next media frame, skipping the group-done and endpoint markers in between. */
+async function nextFrame(consumer: Consumer) {
+	for (;;) {
+		const result = await consumer.next();
+		if (!result || result.frame) return result;
+	}
+}
+
+// The cursor advances past a finished group before its successor arrives, so the successor is the
+// active sequence by the time it rewinds. Detection has to key on the group that supplied the
+// delivered live edge, not on the cursor, or the rewind goes unreported.
+test("Consumer signals a rewind carried by an already-buffered successor", async () => {
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe(), { format: new LegacyFormat(), latency: 30_000 as Time.Milli });
+
+	// Both groups buffer before anything is read, so the successor's frames arrive while the live
+	// edge is still unset and only a re-check after delivery can spot the jump. One sequential
+	// group, so no higher-sequence successor can reveal the reset instead.
+	writeGroupWithLegacyFrames(track, 0, [10_000_000 as Time.Micro]);
+	writeGroupWithLegacyFrames(track, 1, [0 as Time.Micro, 100_000 as Time.Micro]);
+	await settle();
+
+	expect((await nextFrame(consumer))?.frame?.timestamp).toBe(10_000_000 as Time.Micro);
+
+	const first = await nextFrame(consumer);
+	expect(first?.frame?.timestamp).toBe(0 as Time.Micro);
+	expect(first?.discontinuity).toBe(1);
+	expect(first?.continuous).toBe(false);
+
+	const second = await nextFrame(consumer);
+	expect(second?.frame?.timestamp).toBe(100_000 as Time.Micro);
+	expect(second?.discontinuity).toBe(1); // no duplicate reset within a group
+
+	consumer.close();
+});
+
+test("Consumer signals a rewind carried by a later arrival", async () => {
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe(), { format: new LegacyFormat(), latency: 30_000 as Time.Milli });
+
+	writeGroupWithLegacyFrames(track, 0, [10_000_000 as Time.Micro]);
+	await settle();
+	expect((await nextFrame(consumer))?.frame?.timestamp).toBe(10_000_000 as Time.Micro);
+	expect((await consumer.next())?.frame).toBeUndefined(); // group 0 done: the cursor moves to 1
+
+	// Park the reader with nothing buffered, then rewind into the sequence it is waiting on.
+	const pending = nextFrame(consumer);
+	await settle();
+	writeGroupWithLegacyFrames(track, 1, [0 as Time.Micro, 100_000 as Time.Micro]);
+
+	const first = await pending;
+	expect(first?.frame?.timestamp).toBe(0 as Time.Micro);
+	expect(first?.discontinuity).toBe(1);
+	expect(first?.continuous).toBe(false);
+
+	consumer.close();
+});
+
+// A reset resumes from the earliest survivor, which can be a group still ambiguous by sequence.
+// That puts the cursor on a group whose timestamps have yet to rule on it, so the stale check has
+// to run for the active sequence too.
+test("Consumer drops a reneged straggler that the reset left on the cursor", async () => {
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe(), { format: new LegacyFormat(), latency: 30_000 as Time.Milli });
+
+	// Group 10 supplies the live edge and stays open, so the cursor sits on it.
+	const previous = new Group.Producer(10);
+	previous.writeFrame({ payload: encodeLegacy(5_000_000 as Time.Micro), timestamp: Time.Timestamp.now() });
+	track.writeGroup(previous);
+	await settle();
+	expect((await nextFrame(consumer))?.frame?.timestamp).toBe(5_000_000 as Time.Micro);
+
+	// An ambiguous-sequence group opens with no frames, so the reset below cannot classify it.
+	const straggler = new Group.Producer(15);
+	track.writeGroup(straggler);
+	await settle();
+
+	// The rewind. Group 15 survives as ambiguous and, as the earliest survivor, takes the cursor.
+	writeGroupWithLegacyFrames(track, 20, [0 as Time.Micro, 100_000 as Time.Micro]);
+	await settle();
+
+	// Group 15 finally resolves as an old-epoch straggler; its frames must never play.
+	straggler.writeFrame({ payload: encodeLegacy(5_500_000 as Time.Micro), timestamp: Time.Timestamp.now() });
+	straggler.close();
+	await settle();
+
+	const first = await nextFrame(consumer);
+	expect(first?.frame?.timestamp).toBe(0 as Time.Micro);
+	expect(first?.discontinuity).toBe(1);
+	expect((await nextFrame(consumer))?.frame?.timestamp).toBe(100_000 as Time.Micro);
+
+	previous.close();
+	consumer.close();
+});
+
+test("Consumer preserves a new-epoch group after its first frame is consumed", async () => {
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe(), { format: new LegacyFormat(), latency: 30_000 as Time.Milli });
+	const previous = new Group.Producer(10);
+	previous.writeFrame({ payload: encodeLegacy(5_000_000 as Time.Micro), timestamp: Time.Timestamp.now() });
+	track.writeGroup(previous);
+	await settle();
+	expect((await nextFrame(consumer))?.frame?.timestamp).toBe(5_000_000 as Time.Micro);
+
+	const ambiguous = new Group.Producer(15);
+	track.writeGroup(ambiguous);
+	await settle();
+	writeGroupWithLegacyFrames(track, 20, [100_000 as Time.Micro]);
+	await settle();
+	ambiguous.writeFrame({ payload: encodeLegacy(50_000 as Time.Micro), timestamp: Time.Timestamp.now() });
+	await settle();
+	expect((await nextFrame(consumer))?.frame?.timestamp).toBe(50_000 as Time.Micro);
+
+	ambiguous.writeFrame({ payload: encodeLegacy(100_000 as Time.Micro), timestamp: Time.Timestamp.now() });
+	ambiguous.close();
+	await settle();
+	const remainder = await nextFrame(consumer);
+	expect(remainder?.group).toBe(15);
+	expect(remainder?.frame?.timestamp).toBe(100_000 as Time.Micro);
+	expect(remainder?.discontinuity).toBe(1);
+	previous.close();
+	consumer.close();
+});
+
+// Decode order dips below presentation order inside every group with B-frames. That is not a
+// rewind, so the live edge the detector compares against has to be the group's own.
+test("Consumer treats B-frame reordering within a group as continuous", async () => {
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe(), { format: new LegacyFormat(), latency: 30_000 as Time.Milli });
+
+	writeGroupWithLegacyFrames(track, 0, [0 as Time.Micro, 66_000 as Time.Micro, 33_000 as Time.Micro]);
+	await settle();
+	for (const timestamp of [0, 66_000, 33_000]) {
+		const result = await nextFrame(consumer);
+		expect(result?.frame?.timestamp).toBe(timestamp as Time.Micro);
+		expect(result?.discontinuity).toBe(0);
+	}
+
+	// The cursor is now on group 1, whose own frames reorder the same way.
+	writeGroupWithLegacyFrames(track, 1, [100_000 as Time.Micro, 166_000 as Time.Micro, 133_000 as Time.Micro]);
+	await settle();
+	for (const timestamp of [100_000, 166_000, 133_000]) {
+		const result = await nextFrame(consumer);
+		expect(result?.frame?.timestamp).toBe(timestamp as Time.Micro);
+		expect(result?.discontinuity).toBe(0);
+		expect(result?.continuous).toBe(true);
+	}
+
+	consumer.close();
+});
+
 // --- Buffered signal ---
 
 test("Consumer buffered signal updates as frames arrive", async () => {
