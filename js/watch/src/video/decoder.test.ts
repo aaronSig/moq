@@ -23,6 +23,8 @@ class Frame {
 }
 class Codec {
 	static instances: Codec[] = [];
+	static failConfigure = false;
+	static failDecode = false;
 	config?: VideoDecoderConfig;
 	state = "unconfigured";
 	readonly init: VideoDecoderInit;
@@ -31,10 +33,12 @@ class Codec {
 		Codec.instances.push(this);
 	}
 	configure(config: VideoDecoderConfig) {
+		if (Codec.failConfigure) throw new Error("rejected configuration");
 		this.config = config;
 		this.state = "configured";
 	}
 	decode(chunk: EncodedVideoChunk) {
+		if (Codec.failDecode) throw new Error("decode failed");
 		void this.init.output(new Frame(chunk.timestamp) as unknown as VideoFrame);
 	}
 	close() {
@@ -44,6 +48,8 @@ class Codec {
 const saved = new Map<string, PropertyDescriptor | undefined>();
 beforeEach(() => {
 	Codec.instances = [];
+	Codec.failConfigure = false;
+	Codec.failDecode = false;
 	for (const [key, value] of Object.entries({
 		VideoDecoder: Codec,
 		EncodedVideoChunk: class {
@@ -263,6 +269,83 @@ test("the active rendition still owns genuine publisher rewind recovery", async 
 		await settle();
 		expect(f.resets).toBeGreaterThan(0);
 		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(100));
+	} finally {
+		f.close();
+		await settle();
+	}
+});
+
+test("runtime decoder failure retires the failed subscription and identifies its codec", async () => {
+	const f = fixture();
+	try {
+		await settle();
+		f.send("low", 1000);
+		await settle();
+		f.selected.set("high");
+		await settle();
+		Codec.instances.at(-1)!.init.error(new DOMException("Hardware decoder failed", "EncodingError"));
+		await settle();
+		expect(f.decoder.out.error.peek()).toEqual({
+			track: "high",
+			codec: "hvc1.1.6.L93.90",
+			phase: "decode",
+			message: "Hardware decoder failed",
+		});
+		expect(f.opened[1].sub.closed.peek()).not.toBeUndefined();
+		expect(f.opened[0].sub.closed.peek()).toBeUndefined();
+		f.selected.set("low");
+		await settle();
+		f.send("low", 1042);
+		await settle();
+		expect(f.decoder.out.timestamp.peek()).toBe(Time.Milli(1042));
+	} finally {
+		f.close();
+		await settle();
+	}
+});
+
+test("configuration and synchronous decode failures are observable", async () => {
+	for (const phase of ["configure", "decode"] as const) {
+		const f = fixture();
+		try {
+			await settle();
+			f.send("low", 1000);
+			await settle();
+			if (phase === "configure") Codec.failConfigure = true;
+			else Codec.failDecode = true;
+			f.selected.set("high");
+			await settle();
+			if (phase === "decode") {
+				f.send("high", 1042);
+				await settle();
+			}
+			expect(f.decoder.out.error.peek()?.phase).toBe(phase);
+			expect(f.decoder.out.error.peek()?.track).toBe("high");
+			expect(f.opened[1].sub.closed.peek()).not.toBeUndefined();
+		} finally {
+			Codec.failConfigure = false;
+			Codec.failDecode = false;
+			f.close();
+			await settle();
+		}
+	}
+});
+
+test("late errors from a cancelled trial do not poison the active rendition", async () => {
+	const f = fixture();
+	try {
+		await settle();
+		f.send("low", 1000);
+		await settle();
+		f.selected.set("high");
+		await settle();
+		const old = Codec.instances.at(-1)!;
+		f.selected.set("low");
+		await settle();
+		old.init.error(new DOMException("Late callback", "EncodingError"));
+		await settle();
+		expect(f.decoder.out.error.peek()).toBeUndefined();
+		expect(f.opened[0].sub.closed.peek()).toBeUndefined();
 	} finally {
 		f.close();
 		await settle();

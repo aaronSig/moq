@@ -157,3 +157,15 @@ Only the floor is held as decoded PCM; the rest stays as encoded frames with
 backpressure on the decoder, so a large ceiling is cheap. `el.reset()`
 flushes and re-anchors at the next frame, which is how a producer interrupts
 an utterance.
+
+## Runtime decoder failures
+
+`el.video.out.error` reports a failed rendition's track, codec, phase
+(`configure` or `decode`) and message. A successful capability probe does not
+prove that the decoder will stay usable. The failed subscription closes before
+this signal is published; a healthy outgoing rendition keeps its own decoder
+and subscription. Selecting another rendition clears the failure. Cancelled
+trials cannot report late failures against their replacement.
+
+An application can use this signal to choose a supported fallback codec or
+show a playback error. The player does not silently change codec policy.
