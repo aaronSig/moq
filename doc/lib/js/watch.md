@@ -169,3 +169,14 @@ trials cannot report late failures against their replacement.
 
 An application can use this signal to choose a supported fallback codec or
 show a playback error. The player does not silently change codec policy.
+
+## Receive progress during switching
+
+`el.video.out.receive` exposes separate `active` and `pending` subscriptions.
+Each reports a track, subscription identity, completed object count, byte count
+and last completion time on the browser monotonic clock. This advances before
+media reordering, decoding or rendering, including while an upgrade is waiting.
+Bytes include container headers, exclude transport overhead and retransmissions,
+and must not be treated as spare capacity. These are completed JavaScript reads,
+not packet arrival timestamps. A cancelled subscription disappears; reopening
+the same track gets a new identity and counters.

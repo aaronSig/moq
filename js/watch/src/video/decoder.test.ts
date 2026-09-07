@@ -351,3 +351,31 @@ test("late errors from a cancelled trial do not poison the active rendition", as
 		await settle();
 	}
 });
+
+test("pending receive progress is separate from active playback and retires on cancellation", async () => {
+	const f = fixture();
+	try {
+		await settle();
+		f.send("low", 1000);
+		await settle();
+		const active = f.decoder.out.receive.peek().active!;
+		expect(active.track).toBe("low");
+		expect(active.objectsReceived).toBe(1);
+		f.selected.set("high");
+		await settle();
+		f.send("high", 900);
+		await settle();
+		const progress = f.decoder.out.receive.peek();
+		expect(progress.active?.subscriptionId).toBe(active.subscriptionId);
+		expect(progress.pending?.track).toBe("high");
+		expect(progress.pending?.objectsReceived).toBe(1);
+		expect(progress.pending?.subscriptionId).not.toBe(active.subscriptionId);
+		f.selected.set("low");
+		await settle();
+		expect(f.decoder.out.receive.peek().pending).toBeUndefined();
+		expect(f.decoder.out.receive.peek().active?.subscriptionId).toBe(active.subscriptionId);
+	} finally {
+		f.close();
+		await settle();
+	}
+});
