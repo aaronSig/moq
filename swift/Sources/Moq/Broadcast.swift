@@ -74,6 +74,19 @@ public final class BroadcastConsumer: Sendable {
                 name: name, container: container, subscription: subscription))
     }
 
+    /// Start after the latest group already cached by this broadcast consumer.
+    /// A quiet track waits for a new group. Use `subscribeMedia` when the cached
+    /// picture is useful. Explicit group bounds retain normal subscription behavior.
+    /// The caller still decides when this reader can replace the playing picture.
+    public func subscribeMediaLive(
+        name: String,
+        container: Container,
+        subscription: Subscription? = nil
+    ) async throws -> MediaConsumer {
+        MediaConsumer(try await ffi.subscribeMediaLive(
+            name: name, container: container, subscription: subscription))
+    }
+
     /// Subscribe to a raw-audio track, decoding to PCM in the layout `output`
     /// declares. `catalogAudio` is the matching rendition from the catalog.
     public func subscribeAudio(name: String, catalogAudio: Audio, output: AudioDecoderOutput) async throws -> AudioConsumer {
