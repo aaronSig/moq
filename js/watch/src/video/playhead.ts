@@ -1,11 +1,6 @@
 import type * as Catalog from "@moq/hang/catalog";
 import { Time } from "@moq/net";
 
-// How far the incoming rendition may still trail the picture it replaces when we promote it,
-// absorbing scheduling noise so the switch doesn't hinge on landing inside a single frame
-// interval. This is also the largest step backwards a switch can make visible.
-const SLACK = Time.Milli(100);
-
 /**
  * How far behind live a rendition's playhead can sit while still being at its own live edge.
  *
@@ -30,7 +25,7 @@ export interface CaughtUp {
 }
 
 /**
- * Whether the incoming rendition has caught up enough to take over the picture.
+ * Whether the incoming rendition has caught up to take over the picture.
  *
  * The bar is the outgoing playhead rather than the live edge, which is a moving target: the sync
  * buffer grows the moment a coarser rendition is selected, dropping live below the outgoing
@@ -44,5 +39,6 @@ export function caughtUp(props: CaughtUp): boolean {
 	// Nothing is rendering from the outgoing rendition, so there's no picture to step back from.
 	if (props.active === undefined) return true;
 
-	return Time.Milli.add(props.playhead, SLACK) >= props.active;
+	// A tolerance here makes its frames visibly repeat at every rendition change.
+	return props.playhead >= props.active;
 }
